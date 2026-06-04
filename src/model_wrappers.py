@@ -101,8 +101,21 @@ class OpenAIClient(ModelWrapper):
         super().__init__(model_name, **kwargs)
         self.client = OpenAI()
         if 'gpt-5' in model_name.lower():
+            # gpt-5 family are reasoning models: only temperature=1.0 is supported.
             self.temperature = 1.0
-            self.max_tokens = 1024
+            # Keep "thinking" as low as possible so the comparison against
+            # non-reasoning generators (gpt-4.1) is closer to fair. The lowest
+            # available effort differs across the family: the original gpt-5 only
+            # accepts 'minimal' (rejects 'none'), while gpt-5.2/gpt-5.5 dropped
+            # 'minimal' and accept 'none'. setdefault so a caller override wins.
+            model_lower = model_name.lower()
+            lowest_effort = 'none' if any(
+                v in model_lower for v in ('gpt-5.2', 'gpt-5.5')
+            ) else 'minimal'
+            self.additional_params.setdefault('reasoning_effort', lowest_effort)
+            # Reasoning models still need output headroom; never clamp below the
+            # caller's requested max_tokens (e.g. generation passes --max-tokens 4096).
+            self.max_tokens = max(self.max_tokens, 1024)
     
     def generate(self, messages: List[Message]) -> str:
         for attempt in range(self.max_retries):
@@ -291,6 +304,14 @@ class VLLMClient(ModelWrapper):
     
     def __init__(self, model_name: str, **kwargs):
         super().__init__(model_name, **kwargs)
+        # Qwen3 / Qwen3.5 are hybrid reasoning models that emit <think>...</think> by
+        # default, which breaks the short-answer MCQ/Likert parsing (the answer is no
+        # longer in the first few tokens). Disable thinking by prefilling the empty
+        # think block the chat template produces for enable_thinking=False. We do this
+        # manually because the prompt string is hand-built here (apply_chat_template /
+        # chat_template_kwargs are never invoked), and enable_thinking=False over the
+        # server API is itself unreliable (vllm-project/vllm#35574).
+        self.disable_thinking = 'qwen3' in model_name.lower()
         global _vllm_instances
         try:
             if model_name not in _vllm_instances:
@@ -418,11 +439,14 @@ Answers: [/INST]
         for message in messages:
             formatted_msg.append(f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>")
         formatted_str = '\n'.join(formatted_msg)
-        
+
         if messages[-1]['role'] == 'assistant':
             formatted_str += f"\n<|im_start|>user\n"
         else:
             formatted_str += f"\n<|im_start|>assistant\n"
+            if getattr(self, 'disable_thinking', False):
+                # Matches the Qwen3.5 chat template's enable_thinking=False output.
+                formatted_str += "<think>\n\n</think>\n\n"
         return(formatted_str)
 
     def format_messages_for_gemma(self, messages: List[Message]) -> str:
