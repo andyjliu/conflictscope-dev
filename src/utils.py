@@ -1,14 +1,76 @@
 import json
+import re
+
+# Surrounding markdown code fences (```json ... ```) that models often wrap output in.
+_FENCE_RE = re.compile(r'^\s*```(?:json)?\s*|\s*```\s*$', re.IGNORECASE)
+# Bare Python literals that leak into model "JSON". Only rewrite them when they sit in a
+# value position (after ':' / '[' / ',') so we don't corrupt the words True/False/None
+# appearing inside string content.
+_PY_LITERALS = [(re.compile(r'([:\[,]\s*)True\b'), r'\1true'),
+                (re.compile(r'([:\[,]\s*)False\b'), r'\1false'),
+                (re.compile(r'([:\[,]\s*)None\b'), r'\1null')]
+# A pretty-printed `  "key": <value>` line (models emit one field per line).
+_KEY_LINE_RE = re.compile(r'^(\s*"(?:[^"\\]|\\.)*"\s*:\s*)(.*)$')
+
+def _decode_first_object(text):
+    """Parse the first JSON object in text, ignoring trailing data. None on failure."""
+    try:
+        start = text.index('{')
+    except ValueError:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[start:])
+        return obj
+    except json.JSONDecodeError:
+        return None
+
+def _repair_json(text):
+    """Best-effort repair of the malformations open-weight models produce on pretty-
+    printed JSON: string values emitted without surrounding quotes (the dominant
+    Llama-3.3 failure) and the missing member-separating commas that follow from them.
+    Relies on the one-field-per-line formatting these models use; strict parsing is
+    always tried first, so this never touches already-valid JSON."""
+    lines = []
+    for line in text.splitlines():
+        match = _KEY_LINE_RE.match(line)
+        if match:
+            prefix, value = match.groups()
+            stripped = value.strip()
+            # An unquoted string value: doesn't begin with a valid JSON value token.
+            if stripped and stripped[0] not in '"{[' and not re.match(r'(-?\d|true|false|null)', stripped):
+                trailing_comma = stripped.endswith(',')
+                core = (stripped[:-1] if trailing_comma else stripped).rstrip()
+                core = core.replace('\\', '\\\\').replace('"', '\\"')
+                lines.append(f'{prefix}"{core}"' + (',' if trailing_comma else ''))
+                continue
+        lines.append(line)
+    # Re-insert commas dropped between members (e.g. after the requoted value above).
+    repaired = []
+    for idx, line in enumerate(lines):
+        right = line.rstrip()
+        nxt = next((lines[k].lstrip() for k in range(idx + 1, len(lines)) if lines[k].strip()), '')
+        if right and right[-1] in '"}]' and nxt.startswith('"') and not right.endswith(','):
+            right += ','
+        repaired.append(right)
+    return '\n'.join(repaired)
 
 def parse_json(response):
-    response = response.replace("False", "false").replace("True", "true")
-    try:
-        left = response.index('{')
-        right = response.rindex('}') + 1
-        return json.loads(response[left:right])
-    except (ValueError, json.JSONDecodeError) as e:
-        print(f'Error parsing JSON: {e}\nInput given: {response}')
+    if not response:
+        print('Error parsing JSON: empty response')
         return {}
+    cleaned = _FENCE_RE.sub('', response.strip())
+    for pattern, repl in _PY_LITERALS:
+        cleaned = pattern.sub(repl, cleaned)
+    # 1. strict parse (also tolerates trailing "Extra data")
+    obj = _decode_first_object(cleaned)
+    if obj is not None:
+        return obj
+    # 2. best-effort repair of unquoted string values / missing commas
+    obj = _decode_first_object(_repair_json(cleaned))
+    if obj is not None:
+        return obj
+    print(f'Error parsing JSON: unrecoverable\nInput given: {response}')
+    return {}
     
     
 def load_value_dict(json_name: str) -> dict:

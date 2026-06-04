@@ -9,6 +9,10 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
+# Max generation attempts per stage before giving up on a malformed/incomplete response.
+STAGE_ONE_MAX_ATTEMPTS = 3
+STAGE_TWO_MAX_ATTEMPTS = 3
+
 def parse_args():
     parser = ArgumentParser()
 
@@ -57,7 +61,16 @@ def generate_stage_one(v1, v2, client, num_scenarios, start_idx, value_dict):
             prompt_type=prompt_type
         )
         messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": base_prompt}]
-        outputs = parse_json(client.generate(messages))
+        # Open-weight models occasionally emit unparseable JSON; reprompt rather than
+        # dropping the whole batch on the first malformed response.
+        outputs = {}
+        for attempt in range(STAGE_ONE_MAX_ATTEMPTS):
+            outputs = parse_json(client.generate(messages))
+            if outputs:
+                break
+            if attempt < STAGE_ONE_MAX_ATTEMPTS - 1:
+                print(f'Stage-one parse failed for {prompt_type}, retrying '
+                      f'(attempt {attempt + 2}/{STAGE_ONE_MAX_ATTEMPTS})')
 
         for idx, output in enumerate(outputs):
             if idx >= prompt_types_count[prompt_type]:
@@ -97,21 +110,41 @@ def generate_stage_two(scenarios, client, value_dict):
             messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": base_prompt}]
             scenario_list.append((scenario_id, messages))
             
-    outputs = [parse_json(output) for output in client.batch_generate([scenario[1] for scenario in scenario_list], verbose=True)]
-    for (scenario_id, _), output in zip(scenario_list, outputs):
-        try:
-            keys = ['description', 'user_prompt', 'action1', 'action2', 'consequence1', 'consequence2']
-            for key in keys:
-                scenarios[scenario_id][key] = output[key]
+    required_keys = ['description', 'user_prompt', 'action1', 'action2', 'consequence1', 'consequence2']
 
-        except KeyError:
+    def _is_complete(output):
+        return isinstance(output, dict) and all(key in output for key in required_keys)
+
+    outputs = [parse_json(output) for output in client.batch_generate([scenario[1] for scenario in scenario_list], verbose=True)]
+
+    # Reprompt only the scenarios whose stage-two output was unparseable or missing
+    # required keys (a malformed JSON value otherwise drops the scenario entirely).
+    for attempt in range(1, STAGE_TWO_MAX_ATTEMPTS):
+        retry_idx = [i for i, output in enumerate(outputs) if not _is_complete(output)]
+        if not retry_idx:
+            break
+        print(f'Retrying {len(retry_idx)} stage-two generation(s) '
+              f'(attempt {attempt + 1}/{STAGE_TWO_MAX_ATTEMPTS})')
+        retry_outputs = [parse_json(output) for output in
+                         client.batch_generate([scenario_list[i][1] for i in retry_idx], verbose=True)]
+        for i, output in zip(retry_idx, retry_outputs):
+            if _is_complete(output):
+                outputs[i] = output
+
+    for (scenario_id, _), output in zip(scenario_list, outputs):
+        if _is_complete(output):
+            for key in required_keys:
+                scenarios[scenario_id][key] = output[key]
+        else:
             print(f'Removing the following scenario due to instantiation error: {scenarios[scenario_id]}')
             del scenarios[scenario_id]
 
     return scenarios
 
 def deduplicate_scenarios(embeddings, generated_scenarios, embedding_model, threshold):
-    new_embeddings = embedding_model.encode([scenario.get('context', '') + ' ' + scenario.get('action_opportunity', '') for scenario in generated_scenarios.values()])
+    # Cast to str: a malformed generation can yield a non-string (list/dict) field,
+    # and an unguarded `str + list` here would crash dedup and kill the whole run.
+    new_embeddings = embedding_model.encode([str(scenario.get('context', '')) + ' ' + str(scenario.get('action_opportunity', '')) for scenario in generated_scenarios.values()])
     all_embeddings = np.vstack((embeddings, new_embeddings))
     all_similarities = cosine_similarity(all_embeddings)
 
