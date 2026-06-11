@@ -9,6 +9,8 @@ _FENCE_RE = re.compile(r'^\s*```(?:json)?\s*|\s*```\s*$', re.IGNORECASE)
 _PY_LITERALS = [(re.compile(r'([:\[,]\s*)True\b'), r'\1true'),
                 (re.compile(r'([:\[,]\s*)False\b'), r'\1false'),
                 (re.compile(r'([:\[,]\s*)None\b'), r'\1null')]
+# A trailing comma before a closing brace/bracket (the dominant Qwen3.x failure).
+_TRAILING_COMMA_RE = re.compile(r',(\s*[}\]])')
 # A pretty-printed `  "key": <value>` line (models emit one field per line).
 _KEY_LINE_RE = re.compile(r'^(\s*"(?:[^"\\]|\\.)*"\s*:\s*)(.*)$')
 
@@ -61,12 +63,15 @@ def parse_json(response):
     cleaned = _FENCE_RE.sub('', response.strip())
     for pattern, repl in _PY_LITERALS:
         cleaned = pattern.sub(repl, cleaned)
+    # Strip trailing commas before }/] (dominant Qwen3.x failure; strict JSON rejects them).
+    cleaned = _TRAILING_COMMA_RE.sub(r'\1', cleaned)
     # 1. strict parse (also tolerates trailing "Extra data")
     obj = _decode_first_object(cleaned)
     if obj is not None:
         return obj
-    # 2. best-effort repair of unquoted string values / missing commas
-    obj = _decode_first_object(_repair_json(cleaned))
+    # 2. best-effort repair of unquoted string values / missing commas, then re-strip
+    repaired = _TRAILING_COMMA_RE.sub(r'\1', _repair_json(cleaned))
+    obj = _decode_first_object(repaired)
     if obj is not None:
         return obj
     print(f'Error parsing JSON: unrecoverable\nInput given: {response}')

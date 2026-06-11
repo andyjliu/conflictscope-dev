@@ -6,6 +6,7 @@ from argparse import ArgumentParser
 from utils import SYSTEM_PROMPT, MAX_LIKERT, parse_json
 from model_wrappers import gpus_needed
 import os
+import re
 import pandas as pd
 import json
 import glob
@@ -19,7 +20,9 @@ def parse_args():
 
     parser.add_argument('--model', '-m', type=str, required=True)
     parser.add_argument('--temperature', type=float, default=0.0)
-    parser.add_argument('--max-tokens', type=int, default=5)
+    # 12 leaves room for models that emit the end-of-turn marker as literal text
+    # after the answer (e.g. gemma-4-31B "4.0<end_of_turn>") so it can be stripped.
+    parser.add_argument('--max-tokens', type=int, default=12)
     
     parser.add_argument('--scenarios-dir', '-d', type=str, required=True,
                       help='Directory containing CSV files with scenarios')
@@ -111,8 +114,35 @@ Please respond with ONLY a number from 1 to {MAX_LIKERT}. Do not include any oth
 
     return prompt
 
+def process_mcq_response(response: str):
+    """Extract the chosen letter ('A'/'B') from a raw MCQ response, or None.
+
+    Naive `response.strip()[0]` fails for models that prepend a reasoning marker before
+    the answer -- e.g. gemma-4-31B-it emits 'thought\\nA' / '---\\nthought\\nB', so the
+    first char is 't'/'-'. Truncate at any end-of-turn marker, then take the first
+    standalone A/B token. 'thought' contains no standalone A/B, so the first match is the
+    real answer; clean models that emit only 'A'/'B' are unaffected.
+    """
+    text = str(response)
+    for eot_marker in ("<end_of_turn>", "<|eot_id|>", "<|im_end|>", "<eos>", "</s>"):
+        idx = text.find(eot_marker)
+        if idx != -1:
+            text = text[:idx]
+    m = re.search(r"\b([AB])\b", text.upper())
+    return m.group(1) if m else None
+
+
 def process_likert_response(response: str) -> int:
     response = str(response)
+    # Some models (e.g. gemma-4-31B) emit the chat-template end-of-turn marker as
+    # literal text glued to the answer ("1<end_of_turn>...") instead of stopping
+    # generation. That leaves no whitespace before the marker, so float() chokes on
+    # the whole token and every row parses as INVALID. Defensively truncate at the
+    # first end-of-turn marker before tokenizing.
+    for eot_marker in ("<end_of_turn>", "<|eot_id|>", "<|im_end|>", "<eos>", "</s>"):
+        idx = response.find(eot_marker)
+        if idx != -1:
+            response = response[:idx]
     for word in response.split():
         try:
             num = float(word)
@@ -197,9 +227,9 @@ def evaluate_models_mcq(client: ModelWrapper, scenarios_df: pd.DataFrame, steeri
         mcq_responses = client.batch_generate(mcq_messages_list, verbose = True)
         
         for scenario_id, response, action_map in zip(mcq_scenario_ids, mcq_responses, action_maps):
-            choice = response.strip().upper()
-            if choice and choice[0] in ['A', 'B']:
-                original_action = action_map[choice[0]]
+            letter = process_mcq_response(response)
+            if letter is not None:
+                original_action = action_map[letter]
                 choice = 'A' if original_action == 'action1' else 'B'
             else:
                 choice = 'INVALID'
