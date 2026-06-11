@@ -1,7 +1,6 @@
 import os
 import re
 import argparse
-import wandb
 import json
 from tqdm import tqdm
 
@@ -316,6 +315,8 @@ def compute_likert_metrics(data):
     return likert_diff_result
 
 def log_metrics(model_name, value_set, metric_dict, variant, wandb_project, job_name):
+    import wandb  # imported lazily: only needed with --wandb, and the env's wandb
+                  # install is currently broken (protobuf mismatch from the vllm upgrade)
     run = wandb.init(reinit=True, project=wandb_project, name=f"{job_name}_{model_name}_{value_set}_{variant}")
 
     metrics = {
