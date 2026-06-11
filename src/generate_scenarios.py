@@ -27,6 +27,21 @@ def parse_args():
     parser.add_argument('--model', '-m', type=str, default='gpt-4o-mini')
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--max-tokens', type=int, default=4096)
+    parser.add_argument('--reasoning-effort', type=str, default=None,
+                        help="Override reasoning effort for reasoning models (gpt-5 "
+                             "family): low/medium/high (also 'minimal' for gpt-5, "
+                             "'none' for gpt-5.2/5.5). Ignored by non-reasoning models. "
+                             "Defaults to the model's lowest effort if unset.")
+    parser.add_argument('--allow-thinking', action='store_true',
+                        help="For vLLM thinking models (qwen3*): keep the model's "
+                             "<think>...</think> reasoning trace instead of disabling it. "
+                             "Safe for generation (parse_json skips to the first '{'); do "
+                             "NOT use for the short-answer MCQ/Likert eval path. No effect "
+                             "on API or non-thinking models.")
+    parser.add_argument('--max-model-len', type=int, default=None,
+                        help="vLLM context window (max_model_len). Defaults to 4096; raise "
+                             "it (e.g. 16384) when --allow-thinking so the reasoning trace "
+                             "plus the JSON batch both fit. Ignored by API models.")
     parser.add_argument('--output-dir', '-o', type=str, required=True)
     parser.add_argument('--add-to-existing', '-a', action='store_true')
 
@@ -163,10 +178,18 @@ def deduplicate_scenarios(embeddings, generated_scenarios, embedding_model, thre
     
 def main():
     args = parse_args()
+    extra = {}
+    if args.reasoning_effort is not None:
+        extra['reasoning_effort'] = args.reasoning_effort
+    if args.allow_thinking:
+        extra['allow_thinking'] = True
+    if args.max_model_len is not None:
+        extra['max_model_len'] = args.max_model_len
     client = ModelWrapper.create(
         args.model,
         temperature=args.temperature,
-        max_tokens=args.max_tokens
+        max_tokens=args.max_tokens,
+        **extra
     )
     value_dict = load_value_dict(args.value_set)
 

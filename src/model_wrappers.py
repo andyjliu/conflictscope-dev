@@ -51,6 +51,11 @@ class ModelWrapper(ABC):
         self.top_p = top_p
         self.max_retries = max_retries
         self.initial_retry_delay = initial_retry_delay
+        # vLLM-only knobs; pop them out before storing the rest as additional_params so
+        # they don't leak into SamplingParams / the OpenAI/Anthropic API call kwargs.
+        # API clients simply ignore these attributes.
+        self.allow_thinking = kwargs.pop('allow_thinking', False)
+        self.max_model_len = kwargs.pop('max_model_len', None)
         self.additional_params = kwargs
         
         self.consecutive_failures = 0
@@ -129,9 +134,18 @@ class OpenAIClient(ModelWrapper):
                     **self.additional_params
                 )
                 self._handle_api_success()
-                if len(response.choices[0].message.content) == 0:
-                    raise APIError('No content returned from model')
-                return response.choices[0].message.content
+                content = response.choices[0].message.content
+                if not content:
+                    # gpt-5 reasoning models occasionally return no visible content
+                    # (e.g. finish_reason='length' after spending the token budget on
+                    # reasoning). Skip rather than crash: '' parses to {} downstream and
+                    # the scenario is dropped, instead of killing the whole job.
+                    logger.warning(
+                        f"No content returned from {self.model_name} "
+                        f"(finish_reason={response.choices[0].finish_reason}); skipping."
+                    )
+                    return ''
+                return content
             except APIError as e:
                 logger.warning(f"OpenAI API error (attempt {attempt + 1}/{self.max_retries}): {str(e)} for prompt {messages}")
                 if attempt == self.max_retries - 1:
@@ -311,16 +325,25 @@ class VLLMClient(ModelWrapper):
         # manually because the prompt string is hand-built here (apply_chat_template /
         # chat_template_kwargs are never invoked), and enable_thinking=False over the
         # server API is itself unreliable (vllm-project/vllm#35574).
-        self.disable_thinking = 'qwen3' in model_name.lower()
+        # Thinking is disabled by default for qwen3* (keeps the short-answer MCQ/Likert
+        # parsing intact). Pass allow_thinking=True (CLI: --allow-thinking) to let the
+        # model emit its <think>...</think> trace -- only safe for tasks that parse the
+        # full output (e.g. scenario generation, where parse_json skips to the first
+        # '{'), NOT for the max_tokens=5 MCQ/Likert eval path.
+        self.disable_thinking = 'qwen3' in model_name.lower() and not self.allow_thinking
+        # Context window. Default 4096 suits the eval path; thinking generation needs a
+        # bigger window (reasoning trace + JSON batch) -- raise via --max-model-len.
+        max_model_len = self.max_model_len if self.max_model_len is not None else 4096
         global _vllm_instances
         try:
             if model_name not in _vllm_instances:
-                logger.info(f"Loading VLLM Model {model_name}")
+                logger.info(f"Loading VLLM Model {model_name} (max_model_len={max_model_len}, "
+                            f"disable_thinking={self.disable_thinking})")
                 llm_kwargs = {
                     'model': model_name,
                     'gpu_memory_utilization': 0.9,
                     'tensor_parallel_size': gpus_needed(model_name),
-                    'max_model_len': 4096
+                    'max_model_len': max_model_len
                 }
                 if 'mistral' in model_name.lower():
                     llm_kwargs['disable_custom_all_reduce'] = True
