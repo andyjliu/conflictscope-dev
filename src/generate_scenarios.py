@@ -44,6 +44,10 @@ def parse_args():
                              "plus the JSON batch both fit. Ignored by API models.")
     parser.add_argument('--output-dir', '-o', type=str, required=True)
     parser.add_argument('--add-to-existing', '-a', action='store_true')
+    parser.add_argument('--thinking-level', '-tl', type=str, default=None,
+                        help="Gemini 3.x reasoning level: low|medium|high (3.5-flash also minimal). "
+                             "Counts toward max-tokens, so raise --max-tokens at higher levels. "
+                             "Ignored for non-Gemini models.")
 
     return parser.parse_args()
 
@@ -185,6 +189,8 @@ def main():
         extra['allow_thinking'] = True
     if args.max_model_len is not None:
         extra['max_model_len'] = args.max_model_len
+    if args.thinking_level is not None and 'gemini' in args.model.lower():
+        extra['thinking_level'] = args.thinking_level
     client = ModelWrapper.create(
         args.model,
         temperature=args.temperature,

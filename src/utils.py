@@ -60,6 +60,12 @@ def parse_json(response):
     if not response:
         print('Error parsing JSON: empty response')
         return {}
+    # Drop any reasoning trace before the JSON: its prose contains '{' that misleads the decoder. Non-<think> families (gpt-oss harmony, etc.) may need vLLM --reasoning-parser instead.
+    for tag in ('</think>', '[/THINK]', '<|channel|>final<|message|>'):
+        cut = response.rfind(tag)
+        if cut != -1:
+            response = response[cut + len(tag):]
+            break
     cleaned = _FENCE_RE.sub('', response.strip())
     for pattern, repl in _PY_LITERALS:
         cleaned = pattern.sub(repl, cleaned)

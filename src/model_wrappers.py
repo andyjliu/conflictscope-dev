@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import os
 import time
 from typing import List, Optional, Dict, TypedDict, Any
 import logging
@@ -15,7 +16,7 @@ from vllm import LLM, SamplingParams
 logger = logging.getLogger(__name__)
 
 def gpus_needed(model_name: str, bytes_per_param: int = 2, overhead_factor: float = 0.2, gpu_memory_gb: int = 48) -> int:
-    if 'claude' in model_name.lower() or 'gpt' in model_name.lower():
+    if 'claude' in model_name.lower() or 'gpt' in model_name.lower() or 'gemini' in model_name.lower():
         return 0
     
     match = re.search(r'(\d+)b', model_name.lower())
@@ -79,6 +80,8 @@ class ModelWrapper(ABC):
             return OpenAIClient(model_name, **kwargs)
         elif "claude" in model_name.lower():
             return AnthropicClient(model_name, **kwargs)
+        elif "gemini" in model_name.lower():
+            return GeminiClient(model_name, **kwargs)
         else:
             return VLLMClient(model_name, **kwargs)
 
@@ -310,6 +313,113 @@ class AnthropicClient(ModelWrapper):
             self.max_tokens = original_max_tokens
             self.temperature = original_temperature
         
+        return results
+
+class GeminiClient(ModelWrapper):
+    """Google Gemini wrapper via the native google-genai SDK.
+
+    Reads GEMINI_API_KEY (falls back to GOOGLE_API_KEY). System messages are
+    passed as `system_instruction`; remaining messages map role user->"user"
+    and assistant->"model". For Gemini 3.x (reasoning models) thinking tokens
+    count toward max_output_tokens, so we set an explicit thinking level
+    (default 'low'); uncapped thinking starves the JSON answer and truncates it.
+    The logprob path falls back to sampling-based vote counting like
+    AnthropicClient.
+    """
+
+    def __init__(self, model_name: str, thinking_level: str = 'low', **kwargs):
+        super().__init__(model_name, **kwargs)
+        self.thinking_level = thinking_level  # 'low'|'medium'|'high' (3.5-flash also 'minimal'); None -> model default
+        from google import genai  # lazy import: optional dependency
+        self._genai = genai
+        from google.genai import types as genai_types
+        self._types = genai_types
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        self.client = genai.Client(api_key=api_key) if api_key else genai.Client()
+
+    def _split_messages(self, messages: List[Message]):
+        system = None
+        contents = []
+        for m in messages:
+            if m['role'] == 'system':
+                system = m['content']
+            else:
+                role = 'model' if m['role'] == 'assistant' else 'user'
+                contents.append(self._types.Content(
+                    role=role,
+                    parts=[self._types.Part.from_text(text=m['content'])],
+                ))
+        return system, contents
+
+    def _config(self, **overrides):
+        cfg = dict(
+            temperature=self.temperature,
+            max_output_tokens=self.max_tokens,
+            top_p=self.top_p,
+        )
+        if 'gemini-3' in self.model_name.lower() and self.thinking_level:
+            cfg['thinking_config'] = self._types.ThinkingConfig(thinking_level=self.thinking_level)
+        cfg.update(overrides)
+        return self._types.GenerateContentConfig(**cfg)
+
+    def generate(self, messages: List[Message]) -> str:
+        system, contents = self._split_messages(messages)
+        config = self._config(system_instruction=system) if system else self._config()
+        for attempt in range(self.max_retries):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=config,
+                )
+                self._handle_api_success()
+                text = response.text
+                if not text:
+                    raise RuntimeError('No content returned from model')
+                return text
+            except Exception as e:
+                logger.warning(f"Gemini API error (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
+                if attempt == self.max_retries - 1:
+                    logger.error(f"Failed after {self.max_retries} attempts: {str(e)} for prompt {messages}")
+                    self._handle_api_failure(str(e), messages)
+                    return ''
+                self._exponential_backoff(attempt)
+
+    def batch_generate(self, messages_list: List[List[Message]], verbose: bool = False) -> List[str]:
+        responses = []
+        iterator = tqdm(messages_list, desc='Batch Generation') if verbose else messages_list
+        for messages in iterator:
+            responses.append(self.generate(messages))
+        return responses
+
+    def batch_generate_with_probs(self, messages_list: List[List[Message]], outputs: List[str], num_samples: int = 3) -> List[Dict[str, float]]:
+        results = []
+        original_max_tokens = self.max_tokens
+        original_temperature = self.temperature
+        try:
+            self.max_tokens = 5  # only need the first token
+            self.temperature = 1.0  # diverse sampling for vote counting
+            for messages in messages_list:
+                batch_messages = [messages] * num_samples
+                responses = self.batch_generate(batch_messages)
+
+                processed_responses = []
+                for response in responses:
+                    first_token = response.strip().upper()
+                    if first_token and first_token[0] in [o.strip().upper() for o in outputs]:
+                        processed_responses.append(first_token[0])
+
+                counter = Counter(processed_responses)
+                total = len(processed_responses)
+                if total > 0:
+                    probs = {output: counter[output.strip().upper()] / total for output in outputs}
+                else:
+                    logger.warning("No valid samples found for any of the target outputs. Using uniform probabilities.")
+                    probs = {output: 1.0 / len(outputs) for output in outputs}
+                results.append(probs)
+        finally:
+            self.max_tokens = original_max_tokens
+            self.temperature = original_temperature
         return results
 
 _vllm_instances = {}
