@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+logs/
+slurm_logs/
+# generated experiment outputs (keep input data: HHH/ modelspec/ personalprotective/)
+data/06*/
+data/personalprotective_subset/
