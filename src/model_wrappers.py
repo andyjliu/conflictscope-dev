@@ -322,14 +322,26 @@ class GeminiClient(ModelWrapper):
     passed as `system_instruction`; remaining messages map role user->"user"
     and assistant->"model". For Gemini 3.x (reasoning models) thinking tokens
     count toward max_output_tokens, so we set an explicit thinking level
-    (default 'low'); uncapped thinking starves the JSON answer and truncates it.
-    The logprob path falls back to sampling-based vote counting like
-    AnthropicClient.
+    (default 'minimal'); even 'low' burns ~9 thinking tokens before the answer,
+    which starves the tiny MCQ budget (max_output_tokens=12) and returns an empty
+    completion -> every MCQ row parses as INVALID. 'minimal' emits 0 thinking
+    tokens and answers within 12 tokens. The logprob path falls back to
+    sampling-based vote counting like AnthropicClient.
     """
 
-    def __init__(self, model_name: str, thinking_level: str = 'low', **kwargs):
+    def __init__(self, model_name: str, thinking_level: str = 'minimal', **kwargs):
         super().__init__(model_name, **kwargs)
-        self.thinking_level = thinking_level  # 'low'|'medium'|'high' (3.5-flash also 'minimal'); None -> model default
+        # gemini-3 thinking levels: 'minimal'|'low'|'medium'|'high' (None -> default).
+        # 'minimal' (0 thinking tokens) is what the short-answer MCQ/Likert path needs,
+        # but gemini-3 *pro* rejects 'minimal' with 400 INVALID_ARGUMENT -- only flash /
+        # flash-lite accept it. For models that reject minimal, fall back to 'low'; the
+        # budget headroom needed so a few thinking tokens don't starve the answer is
+        # added in _config (the eval path clamps max_tokens to 5).
+        name = model_name.lower()
+        self._minimal_unsupported = 'gemini-3' in name and 'pro' in name
+        if thinking_level == 'minimal' and self._minimal_unsupported:
+            thinking_level = 'low'
+        self.thinking_level = thinking_level  # effective level after the pro fallback
         from google import genai  # lazy import: optional dependency
         self._genai = genai
         from google.genai import types as genai_types
@@ -359,6 +371,13 @@ class GeminiClient(ModelWrapper):
         )
         if 'gemini-3' in self.model_name.lower() and self.thinking_level:
             cfg['thinking_config'] = self._types.ThinkingConfig(thinking_level=self.thinking_level)
+            # Non-minimal levels spend thinking tokens that count toward the budget; the
+            # MCQ/Likert path clamps max_output_tokens to 5, which a thinking model burns
+            # entirely on thoughts -> empty completion -> INVALID. Give headroom so the
+            # answer fits. Thoughts come back as separate parts, so this doesn't leak into
+            # the parsed text (the parser still reads the first answer token).
+            if self.thinking_level != 'minimal':
+                cfg['max_output_tokens'] = max(self.max_tokens, 2048)
         cfg.update(overrides)
         return self._types.GenerateContentConfig(**cfg)
 
