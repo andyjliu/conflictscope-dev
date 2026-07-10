@@ -3,7 +3,7 @@ from simulated_conversation import ScenarioData, load_scenario, ValueTester
 from tqdm import tqdm
 from typing import Dict, List, Any, Optional
 from argparse import ArgumentParser
-from utils import SYSTEM_PROMPT, MAX_LIKERT, parse_json
+from utils import SYSTEM_PROMPT, parse_json, MAX_LIKERT
 from model_wrappers import gpus_needed
 import os
 import re
@@ -37,40 +37,76 @@ def parse_args():
                       help='Only evaluate scenarios with keep_scenario=True')
     parser.add_argument('--batch-size', '-bs', type=int, default=32)
     
+    # Optional arguments for interactive evaluation
     parser.add_argument('--user-model', type=str, help='Model for user simulation (defaults to 4o-mini)', default = 'gpt-4o-mini')
     parser.add_argument('--assistant-model', type=str, help='Model for assistant (defaults to --model)')
     parser.add_argument('--judge-model', type=str, help='Model for judgment (defaults to 4o-mini)', default = 'gpt-4o-mini')
     parser.add_argument('--cache', action='store_true')
     parser.add_argument('--steer-prompt', type=str, help='Path to a text file containing the steering prompt for the assistant')
+    parser.add_argument('--max-scenarios', type=int, default=None,
+                      help='Maximum number of scenarios to evaluate per CSV file')
+
+    # Remote vLLM endpoints (URL like http://host:port/v1, or a hostfile path).
+    # When set, that model is served remotely (no local weights / GPUs here).
+    parser.add_argument('--api-base', type=str, default=None,
+                      help='Remote vLLM endpoint for --model (MCQ, and assistant default)')
+    parser.add_argument('--user-api-base', type=str, default=None,
+                      help='Remote vLLM endpoint for the user-simulator model')
+    parser.add_argument('--assistant-api-base', type=str, default=None,
+                      help='Remote vLLM endpoint for the assistant model')
+    parser.add_argument('--judge-api-base', type=str, default=None,
+                      help='Remote vLLM endpoint for the judge model')
 
     return parser.parse_args()
 
 class ModelClientManager:
+    """Class to manage model clients and reuse them when possible."""
     
-    def __init__(self):
+    def __init__(self, endpoints: Optional[Dict[str, str]] = None):
         self.clients = {}
-    
+        # model_name -> remote vLLM endpoint (URL or hostfile). When present the
+        # model is served remotely, so no local weights/GPUs are used for it.
+        self.endpoints = endpoints or {}
+
     def get_client(self, model_name: str, temperature: float = 0.0, max_tokens: int = 1000) -> ModelWrapper:
+        """
+        Gets a client for the specified model, creating a new one only if necessary.
+        Uses a composite key of model_name + temperature + max_tokens to identify unique configurations.
+        """
         import os
         client_key = f"{model_name}_{temperature}_{max_tokens}"
         if client_key not in self.clients:
-            gpus_used = 0
-            gpus_required = gpus_needed(model_name)
-            for existing_client_key in self.clients.keys():
-                existing_model_name = '_'.join(existing_client_key.split('_')[:-2])
-                gpus_used += gpus_needed(existing_model_name)
-                
-            cuda_visible_devices = range(gpus_used, gpus_used + gpus_required)
-            os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, cuda_visible_devices))
+            api_base = self.endpoints.get(model_name)
+            # Only allocate local GPUs for in-process models; remotely served
+            # models (api_base set) load no weights here.
+            if not api_base:
+                # 7/7 Hack for CUDA device setting
+                gpus_used = 0
+                gpus_required = gpus_needed(model_name)
+                for existing_client_key in self.clients.keys():
+                    existing_model_name = '_'.join(existing_client_key.split('_')[:-2])
+                    if self.endpoints.get(existing_model_name):
+                        continue  # remote model, occupies no local GPU
+                    gpus_used += gpus_needed(existing_model_name)
+
+                cuda_visible_devices = range(gpus_used, gpus_used + gpus_required)
+                if gpus_required > 0:
+                    os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, cuda_visible_devices))
             self.clients[client_key] = ModelWrapper.create(
                 model_name,
                 temperature=temperature,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
+                api_base=api_base,
             )
-        
+
         return self.clients[client_key]
 
 def create_scenario_prompt_mcq(scenario_row) -> tuple[str, dict]:
+    """
+    Create a multiple choice prompt from a scenario row from the DataFrame.
+    Returns the prompt and a mapping of which letter corresponds to which action.
+    """
+    # Randomly decide whether to swap the actions
     should_swap = random.choice([True, False])
     
     if should_swap:
@@ -96,7 +132,18 @@ Please respond with ONLY the letter A or B. Do not include any other text in you
     return prompt, action_map
 
 def create_likert_prompt(scenario_row, action_key: str) -> str:
+    """
+    Create a prompt to get Likert scale rating for a single action.
+    
+    Args:
+        scenario_row: Row from the scenarios DataFrame
+        action_key: Either 'action1' or 'action2' to specify which action to evaluate
+        
+    Returns:
+        Prompt string for evaluating the specified action
+    """
     action = scenario_row[action_key]
+    
     prompt = f"""Consider the following scenario:
 
 {scenario_row['description']}
@@ -155,18 +202,35 @@ def process_likert_response(response: str) -> int:
     
 
 def load_scenarios_from_csv(csv_path: str, filter_keep_only: bool = False) -> pd.DataFrame:
+    """
+    Load scenarios from a CSV file.
+    
+    Args:
+        csv_path: Path to the CSV file
+        filter_keep_only: If True, only keep scenarios with keep_scenario=True
+        
+    Returns:
+        DataFrame containing the scenarios
+    """
     df = pd.read_csv(csv_path)
+    
+    # Parse check_results column if it exists
     if 'check_results' in df.columns:
         df['check_results'] = df['check_results'].apply(
             lambda x: json.loads(x) if isinstance(x, str) else x
         )
     
+    # Filter if requested
     if filter_keep_only:
         df = df[df['keep_scenario'] == True]
     
     return df
 
 def convert_row_to_scenario(row) -> Dict[str, Any]:
+    """
+    Convert a DataFrame row to a scenario dictionary format
+    required by the ValueTester and other functions.
+    """
     scenario = {
         'context': row.get('context', ''),
         'description': row['description'],
@@ -177,17 +241,27 @@ def convert_row_to_scenario(row) -> Dict[str, Any]:
         'action2': row['action2']
     }
     
+    # Add check_results if available
     if 'check_results' in row:
         scenario['check_results'] = row['check_results']
     
     return scenario
 
 def evaluate_models_mcq(client: ModelWrapper, scenarios_df: pd.DataFrame, steering_prompt: Optional[str] = None) -> Dict[str, Dict[str, str]]:
+    """
+    Probe the model's propensity to follow different principles when given as MCQ questions.
+    Now includes independent Likert scale evaluation for each action.
+    
+    Input: DataFrame of scenarios
+    Output: A dictionary mapping scenario_ids to model choices and Likert ratings.
+    """
     results = {}
     
+    # Step 1: Prepare and process MCQ choice
     mcq_messages_list = []
     mcq_scenario_ids = []
-    action_maps = []
+    action_maps = []  # Store the action mappings for each scenario
+    mcq_prompts = []  # Store the MCQ prompts for logging
     
     for _, row in scenarios_df.iterrows():
         scenario_id = row['scenario_id']
@@ -199,14 +273,19 @@ def evaluate_models_mcq(client: ModelWrapper, scenarios_df: pd.DataFrame, steeri
         mcq_messages_list.append(messages)
         mcq_scenario_ids.append(scenario_id)
         action_maps.append(action_map)
+        mcq_prompts.append(prompt)  # Store the user prompt for logging
     
+    # Step 2: Prepare and process Likert scale evaluations for each action
     likert_a_messages_list = []
     likert_b_messages_list = []
     likert_scenario_ids = []
+    likert_a_prompts = []  # Store the Likert A prompts for logging
+    likert_b_prompts = []  # Store the Likert B prompts for logging
     
     for _, row in scenarios_df.iterrows():
         scenario_id = row['scenario_id']
         
+        # Create prompts for both actions
         prompt_a = create_likert_prompt(row, 'action1')
         prompt_b = create_likert_prompt(row, 'action2')
         
@@ -222,11 +301,15 @@ def evaluate_models_mcq(client: ModelWrapper, scenarios_df: pd.DataFrame, steeri
         likert_a_messages_list.append(messages_a)
         likert_b_messages_list.append(messages_b)
         likert_scenario_ids.append(scenario_id)
+        likert_a_prompts.append(prompt_a)  # Store the user prompt for logging
+        likert_b_prompts.append(prompt_b)  # Store the user prompt for logging
     
     try:
+        # Process MCQ responses
         mcq_responses = client.batch_generate(mcq_messages_list, verbose = True)
         
-        for scenario_id, response, action_map in zip(mcq_scenario_ids, mcq_responses, action_maps):
+        # Initialize results with MCQ choices
+        for scenario_id, response, action_map, prompt in zip(mcq_scenario_ids, mcq_responses, action_maps, mcq_prompts):
             letter = process_mcq_response(response)
             if letter is not None:
                 original_action = action_map[letter]
@@ -236,18 +319,38 @@ def evaluate_models_mcq(client: ModelWrapper, scenarios_df: pd.DataFrame, steeri
             
             results[scenario_id] = {
                 "choice": choice,
-                "likert": None,
-                "likert_a": None,
-                "likert_b": None
+                "raw_response": response,
+                "mcq_prompt": prompt,
+                "mcq_response": response,
+                "likert": None, # Will be filled in later
+                "likert_a": None,  # Will be filled in later
+                "likert_b": None,  # Will be filled in later
+                "likert_a_prompt": None,  # Will be filled in later
+                "likert_b_prompt": None,  # Will be filled in later
+                "likert_a_response": None,  # Will be filled in later
+                "likert_b_response": None,  # Will be filled in later
+                "reasoning": None  # Will be filled in later
             }
         
+        # Process Likert responses for action A
         likert_a_responses = client.batch_generate(likert_a_messages_list, verbose = True)
+        
+        # Process Likert responses for action B
         likert_b_responses = client.batch_generate(likert_b_messages_list, verbose = True)
         
-
-        for scenario_id, response_a, response_b in zip(likert_scenario_ids, likert_a_responses, likert_b_responses):
+        # Process both sets of Likert responses
+        for scenario_id, response_a, response_b, prompt_a, prompt_b in zip(likert_scenario_ids, likert_a_responses, likert_b_responses, likert_a_prompts, likert_b_prompts):
             try:
+                # Store prompts and responses for logging
+                results[scenario_id]["likert_a_prompt"] = prompt_a
+                results[scenario_id]["likert_b_prompt"] = prompt_b
+                results[scenario_id]["likert_a_response"] = response_a
+                results[scenario_id]["likert_b_response"] = response_b
+                
+                # Process response for action A
                 likert_a = process_likert_response(response_a.strip())
+                
+                # Process response for action B
                 likert_b = process_likert_response(response_b.strip())
                 
                 if isinstance(likert_a, int) and isinstance(likert_b, int):
@@ -273,9 +376,17 @@ def evaluate_models_mcq(client: ModelWrapper, scenarios_df: pd.DataFrame, steeri
         for scenario_id in mcq_scenario_ids:
             results[scenario_id] = {
                 "choice": 'ERROR',
+                "raw_response": str(e),
+                "mcq_prompt": 'ERROR',
+                "mcq_response": str(e),
                 "likert": 'ERROR',
                 "likert_a": 'ERROR',
-                "likert_b": 'ERROR'
+                "likert_b": 'ERROR',
+                "likert_a_prompt": 'ERROR',
+                "likert_b_prompt": 'ERROR',
+                "likert_a_response": 'ERROR',
+                "likert_b_response": 'ERROR',
+                "reasoning": 'ERROR'
             }
     
     return results
@@ -292,8 +403,16 @@ def evaluate_models_conversation(
     cache_file: Optional[str] = None,
     steering_prompt: Optional[str] = None
 ) -> Dict[str, Dict[str, Any]]:
+    """
+    Probe the model's propensity to follow different principles in conversational contexts.
+    Uses batched processing for improved performance.
+    
+    Input: DataFrame of scenarios
+    Output: A dictionary mapping scenario_ids to model choices.
+    """
     results = {}
     
+    # Get the required model clients
     user_client = client_manager.get_client(
         user_model, 
         temperature=temperature, 
@@ -312,6 +431,7 @@ def evaluate_models_conversation(
         max_tokens=max_tokens
     )
     
+    # Create the batch tester
     batch_tester = ValueTester(
         user_client=user_client,
         assistant_client=assistant_client,
@@ -320,11 +440,13 @@ def evaluate_models_conversation(
         steering_prompt=steering_prompt
     )
     
+    # Process scenarios in batches
     total_scenarios = len(scenarios_df)
     for batch_start in tqdm(range(0, total_scenarios, batch_size), desc='Processing scenario batches'):
         batch_end = min(batch_start + batch_size, total_scenarios)
         batch_df = scenarios_df.iloc[batch_start:batch_end]
         
+        # Convert batch to scenario format
         batch_scenarios = []
         scenario_ids = []
         
@@ -339,11 +461,14 @@ def evaluate_models_conversation(
             except KeyError as e:
                 print(f"Skipping scenario due to missing required field: {e}")
         
+        # Skip empty batches
         if not batch_scenarios:
             continue
             
+        # Process the batch
         batch_results = batch_tester.test_scenarios_batch(batch_scenarios, scenario_ids)
         
+        # Store results
         for scenario_id, result in zip(scenario_ids, batch_results):
             try:
                 likert = process_likert_response(result["judgment"]["likert"])
@@ -351,7 +476,7 @@ def evaluate_models_conversation(
                     "conversation": batch_tester._format_conversation(result["conversation"]),
                     "choice": result["judgment"]["action"],
                     "likert": -1 + 2*(likert - 1)/(MAX_LIKERT - 1) if type(likert) == int else 'INVALID',
-                    "reasoning": result["judgment"]["reasoning"]
+                    "reasoning": result["judgment"].get("reasoning", "")
                 }
             except KeyError:
                 print(f"Exception on scenario {scenario_id}")
@@ -373,15 +498,34 @@ def process_csv_file(
     judge_model: str,
     output_file: str
 ) -> pd.DataFrame:
+    """
+    Process a single CSV file and return results DataFrame.
+    
+    Args:
+        csv_path: Path to the CSV file
+        client_manager: ModelClientManager instance
+        args: Command line arguments
+        user_model: Model for user simulation
+        assistant_model: Model for assistant simulation
+        judge_model: Model for judgment
+        output_file: Path to the output CSV file
+        
+    Returns:
+        DataFrame with evaluation results
+    """
     print(f"Processing {csv_path}")
     
+    # Load scenarios from CSV
     scenarios_df = load_scenarios_from_csv(csv_path, filter_keep_only=args.filter)
+    if args.max_scenarios is not None:
+        scenarios_df = scenarios_df.head(args.max_scenarios)
     print(f"Loaded {len(scenarios_df)} scenarios from {csv_path}")
     
     if len(scenarios_df) == 0:
         print(f"No valid scenarios found in {csv_path}. Skipping.")
         return pd.DataFrame()
 
+    # Check if output file exists and has results for these scenarios
     try:
         existing_results = pd.read_csv(output_file)
     except Exception as e:
@@ -390,6 +534,7 @@ def process_csv_file(
     if os.path.exists(output_file) and not args.force_recompute:
         try:
             existing_results = pd.read_csv(output_file)
+            # Filter to only scenarios from this CSV
             existing_results_overlap = existing_results[existing_results['scenario_id'].isin(scenarios_df['scenario_id'])]
             
             if len(existing_results_overlap) == len(scenarios_df):
@@ -397,6 +542,7 @@ def process_csv_file(
                 return existing_results
             elif len(existing_results_overlap) > 0:
                 print(f"Found partial results for {len(existing_results)}/{len(scenarios_df)} scenarios in {csv_path}.")
+                # Remove scenarios that already have results
                 scenarios_df = scenarios_df[~scenarios_df['scenario_id'].isin(existing_results['scenario_id'])]
                 print(f"Will process remaining {len(scenarios_df)} scenarios.")
         except Exception as e:
@@ -404,9 +550,11 @@ def process_csv_file(
             print("Will process all scenarios.")
             
     elif os.path.exists(output_file) and args.force_recompute:
+        # delete all results where scenario id is in scenarios_df
         existing_results = existing_results[~existing_results['scenario_id'].isin(scenarios_df['scenario_id'])]
         print(f"Will process all {len(scenarios_df)} scenarios.")
     
+    # Load steering prompt if specified
     steering_prompt = None
     if args.steer_prompt:
         try:
@@ -417,6 +565,7 @@ def process_csv_file(
             return existing_results
 
     if args.interactive:
+        # Set appropriate parameters for conversational evaluation
         if args.temperature == 0.0 or args.max_tokens <= 5:
             print("Using default conversation parameters")
             temperature = DEFAULT_CONVERSATION_TEMPERATURE
@@ -438,7 +587,7 @@ def process_csv_file(
             'conversation': []
         })
 
-        cache_file = os.path.join(args.output_dir, 'prompts.json') if args.cache else None
+        cache_file = os.path.join(args.output_dir, 'cache.json') if args.cache else None        
 
         results = evaluate_models_conversation(
             client_manager,
@@ -454,6 +603,7 @@ def process_csv_file(
         )
         
         for scenario_id, result in results.items():
+            # Find the original row
             scenario_rows = scenarios_df[scenarios_df['scenario_id'] == scenario_id]
             if len(scenario_rows) == 0:
                 continue
@@ -476,13 +626,15 @@ def process_csv_file(
             
             results_df = pd.concat([results_df, pd.DataFrame([new_row])], ignore_index=True)
     
-    else:
+    else:  # MCQ Evaluation
+        # Get the MCQ client
         mcq_client = client_manager.get_client(
             args.model,
             temperature=args.temperature,
             max_tokens=args.max_tokens
         )
         
+        # Updated to include likert in the results DataFrame
         results_df = pd.DataFrame({
             'scenario_id': [],
             'value1': [], 
@@ -492,11 +644,18 @@ def process_csv_file(
             'likert': [],
             'likert_a': [],
             'likert_b': [],
+            'mcq_prompt': [],
+            'mcq_response': [],
+            'likert_a_prompt': [],
+            'likert_a_response': [],
+            'likert_b_prompt': [],
+            'likert_b_response': [],
         })
         
         results = evaluate_models_mcq(mcq_client, scenarios_df, steering_prompt=steering_prompt)
         
         for scenario_id, result in results.items():
+            # Find the original row
             scenario_rows = scenarios_df[scenarios_df['scenario_id'] == scenario_id]
             if len(scenario_rows) == 0:
                 continue
@@ -513,10 +672,17 @@ def process_csv_file(
                 'likert': result['likert'],
                 'likert_a': result['likert_a'],
                 'likert_b': result['likert_b'],
+                'mcq_prompt': result['mcq_prompt'],
+                'mcq_response': result['mcq_response'],
+                'likert_a_prompt': result['likert_a_prompt'],
+                'likert_a_response': result['likert_a_response'],
+                'likert_b_prompt': result['likert_b_prompt'],
+                'likert_b_response': result['likert_b_response'],
             }
             
             results_df = pd.concat([results_df, pd.DataFrame([new_row])], ignore_index=True)
     
+    # Combine new results with existing results
     if not existing_results.empty:
         results_df = pd.concat([existing_results, results_df], ignore_index=True)
     
@@ -524,18 +690,33 @@ def process_csv_file(
 
 def main():
     args = parse_args()
-    client_manager = ModelClientManager()
 
+    # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)
     if args.output_name is not None:
         output_file = os.path.join(args.output_dir, args.output_name)
     else:
         output_file = os.path.join(args.output_dir, f"{args.model.split('/')[-1]}.csv")
-    
+
+    # Set default models if not specified
     user_model = args.user_model if args.user_model else args.model
     assistant_model = args.assistant_model if args.assistant_model else args.model
     judge_model = args.judge_model if args.judge_model else args.model
-    
+
+    # Map each model to its remote vLLM endpoint (if any). --api-base covers the
+    # MCQ model and the assistant default; per-role flags override per model.
+    endpoints = {}
+    if args.api_base:
+        endpoints[args.model] = args.api_base
+    if args.user_api_base:
+        endpoints[user_model] = args.user_api_base
+    if args.assistant_api_base:
+        endpoints[assistant_model] = args.assistant_api_base
+    if args.judge_api_base:
+        endpoints[judge_model] = args.judge_api_base
+    client_manager = ModelClientManager(endpoints=endpoints)
+
+    # Load steering prompt if specified
     steering_prompt = None
     if args.steer_prompt:
         try:
@@ -545,6 +726,7 @@ def main():
             print(f"Error loading steering prompt: {e}")
             return
     
+    # Find all CSV files in the input directory
     csv_files = glob.glob(os.path.join(args.scenarios_dir, "*.csv"))
     
     if not csv_files:
@@ -553,8 +735,10 @@ def main():
     
     print(f"Found {len(csv_files)} CSV files to process")
     
+    # Initialize an empty DataFrame to store all results
     all_results_df = pd.DataFrame()
     
+    # Process each CSV file and accumulate results
     for csv_path in csv_files:
         results_df = process_csv_file(
             csv_path,
@@ -567,9 +751,10 @@ def main():
         )
         
         if not results_df.empty:
+            # Save results after each CSV file is processed
             results_df.to_csv(output_file, index=False)
             print(f"Updated results saved to {output_file}")
-            all_results_df = results_df
+            all_results_df = results_df  # Update the all_results_df with latest results
     
     print(f"Evaluation complete. Processed {len(csv_files)} CSV files with {len(all_results_df)} total scenarios.")
 
