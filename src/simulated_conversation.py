@@ -1,4 +1,4 @@
-from typing import TypedDict, List
+from typing import TypedDict, List, Dict
 from dataclasses import dataclass
 from model_wrappers import ModelWrapper, Message
 from utils import parse_json, MAX_LIKERT, SYSTEM_PROMPT
@@ -6,6 +6,7 @@ import json
 import fcntl
 from contextlib import contextmanager
 import time
+# Required fields for scenarios
 REQUIRED_FIELDS = [
     'description', 
     'user_prompt',
@@ -37,6 +38,19 @@ class ScenarioData(TypedDict, total=False):
     prompt_type: str
 
 def load_scenario(json_data: dict) -> ScenarioData:
+    """
+    Extract required fields from a JSON object to create a scenario.
+    Additional fields in the JSON are ignored.
+    
+    Args:
+        json_data: Dictionary containing at least the required fields
+        
+    Returns:
+        ScenarioData with required fields
+    
+    Raises:
+        KeyError: If any required field is missing
+    """
     json_data = {k.lower(): v for k, v in json_data.items()}
     try:
         return {field: json_data[field] for field in REQUIRED_FIELDS}
@@ -91,14 +105,54 @@ class ValueTester:
             if scenario_id in cache and isinstance(cache[scenario_id], str):
                 return cache[scenario_id]
             cache[scenario_id] = response
-            
+
             with open(self.cache_file, 'w') as f:
                 json.dump(cache, f, indent=2, ensure_ascii=False)
             return response
-        
+
+    def batch_populate_cache(self, scenario_datas: List[dict], user_prompts: List[List[Message]]) -> Dict[str, str]:
+        """Batched analogue of populate_cache_if_needed for first-turn user
+        messages. Cache hits return immediately; all misses are generated
+        concurrently via batch_generate (instead of one blocking generate per
+        scenario), then written to the shared cache in a single locked pass.
+        Returns {scenario_id: user_response}, ordered to match scenario_datas."""
+        results: Dict[str, str] = {}
+        with file_lock(f"{self.cache_file}.lock"):
+            cache = self.read_cache_with_retry(self.cache_file)
+        miss_data, miss_prompts = [], []
+        for sd, prompt in zip(scenario_datas, user_prompts):
+            sid = sd["scenario_id"]
+            if sid in cache and isinstance(cache[sid], str):
+                results[sid] = cache[sid]
+            else:
+                miss_data.append(sd)
+                miss_prompts.append(prompt)
+
+        if miss_prompts:
+            responses = self.user_client.batch_generate(miss_prompts)
+            for sd, resp in zip(miss_data, responses):
+                # Artifact expansion is rare; apply per-response after the batch.
+                resp = self.generate_artifact_if_needed(sd["scenario"], resp)
+                results[sd["scenario_id"]] = resp
+            # Single locked write; re-read first so we don't clobber entries a
+            # concurrent job populated, and prefer any value already present.
+            with file_lock(f"{self.cache_file}.lock"):
+                cache = self.read_cache_with_retry(self.cache_file)
+                for sd in miss_data:
+                    sid = sd["scenario_id"]
+                    if sid in cache and isinstance(cache[sid], str):
+                        results[sid] = cache[sid]
+                    else:
+                        cache[sid] = results[sid]
+                with open(self.cache_file, 'w') as f:
+                    json.dump(cache, f, indent=2, ensure_ascii=False)
+        return results
+
     def generate_artifact_if_needed(self, scenario: ScenarioData, user_response: str) -> str:
+        # Check if response contains artifact tags
         if '<ARTIFACT>' in user_response and '</ARTIFACT>' in user_response:
             try:
+                # Find the start and end positions of the artifact tags
                 start_tag = '<ARTIFACT>'
                 end_tag = '</ARTIFACT>'
                 start_pos = user_response.find(start_tag)
@@ -124,8 +178,10 @@ class ValueTester:
                 return (user_response[:start_pos] + artifact
                         + user_response[end_pos + len(end_tag):])
 
+
             except Exception as e:
                 print(f"Error processing artifact in user response: {e}")
+                # Return the original response if artifact processing fails
                 return user_response
         else:
             return user_response
@@ -174,6 +230,8 @@ class ValueTester:
         return user_responses
 
     def test_scenarios_batch(self, scenarios: List[ScenarioData], scenario_ids: List[str]) -> List[dict]:
+        """Run multiple scenarios in batch processing mode with caching"""
+        # Initialize conversations for all scenarios
         active_scenarios = []
         for scenario, scenario_id in zip(scenarios, scenario_ids):
             active_scenarios.append({
@@ -185,46 +243,61 @@ class ValueTester:
                 "result": None
             })
         
+        # Process turns until all scenarios are completed or max_turns reached
         while active_scenarios and any(not s["completed"] for s in active_scenarios):
+            # Get all active (incomplete) scenarios
             incomplete_scenarios = [s for s in active_scenarios if not s["completed"]]
             if not incomplete_scenarios:
                 break
                 
+            # BATCH USER STEP: Generate user messages for all incomplete scenarios
             user_prompts = []
             scenarios_for_generation = []
+            cache_data, cache_prompts = [], []
             for scenario_data in incomplete_scenarios:
                 if len(scenario_data["conversation"]) == 0 and self.cache_file and scenario_data["scenario_id"]:
-                    user_prompt = self._create_user_prompt(scenario_data["scenario"], [])
-                    user_response = self.populate_cache_if_needed(
-                        scenario_data["scenario_id"], 
-                        scenario_data["scenario"],
-                        user_prompt
-                    )
-                    scenario_data["conversation"].append({"role": "user", "content": user_response})
+                    # First-turn + caching: defer to a single batched cache pass
+                    # (avoids one blocking generate per scenario).
+                    cache_data.append(scenario_data)
+                    cache_prompts.append(self._create_user_prompt(scenario_data["scenario"], []))
                 else:
-                    user_prompts.append(self._create_user_prompt(scenario_data["scenario"], 
+                    user_prompts.append(self._create_user_prompt(scenario_data["scenario"],
                                                               scenario_data["conversation"]))
                     scenarios_for_generation.append(scenario_data)
+
+            if cache_data:
+                cached = self.batch_populate_cache(cache_data, cache_prompts)
+                for scenario_data in cache_data:
+                    scenario_data["conversation"].append(
+                        {"role": "user", "content": cached[scenario_data["scenario_id"]]})
 
             if scenarios_for_generation:
                 user_responses = self.user_client.batch_generate(user_prompts)
                 user_responses = self.expand_artifacts_batch(
                     [s["scenario"] for s in scenarios_for_generation], user_responses)
 
+
                 for scenario_data, user_response in zip(scenarios_for_generation, user_responses):
                     scenario_data["conversation"].append({"role": "user", "content": user_response})
             
+            # BATCH ASSISTANT STEP: Generate assistant responses for all incomplete scenarios
             assistant_prompts = []
             for scenario_data in incomplete_scenarios:
-                assistant_prompt = self._create_assistant_prompt(scenario_data["conversation"])
+                assistant_prompt = self._create_assistant_prompt(
+                    scenario_data["conversation"],
+                    scenario=scenario_data["scenario"],
+                )
                 assistant_prompts.append(assistant_prompt)
             
+            # Batch process assistant messages
             assistant_responses = self.assistant_client.batch_generate(assistant_prompts)
             
+            # Add assistant responses to conversations
             for scenario_data, assistant_response in zip(incomplete_scenarios, assistant_responses):
                 scenario_data["conversation"].append({"role": "assistant", "content": assistant_response})
                 scenario_data["turn_count"] += 1
             
+            # BATCH JUDGMENT STEP: Check which scenarios are ready for judgment
             judgment_needed = []
             for scenario_data in incomplete_scenarios:
                 if scenario_data["turn_count"] >= self.min_turns:
@@ -239,8 +312,10 @@ class ValueTester:
                     )
                     judge_prompts.append(judge_prompt)
                 
+                # Batch process judgments
                 judge_responses = self.judge_client.batch_generate(judge_prompts)
                 
+                # Process judgments
                 for scenario_data, judge_response in zip(judgment_needed, judge_responses):
                     judgment = parse_json(judge_response)
                     if str(judgment.get("resolved", "")).lower() == 'true':
@@ -250,17 +325,20 @@ class ValueTester:
                             "judgment": judgment
                         }
                     elif scenario_data["turn_count"] >= self.max_turns:
+                        # Force completion at max turns
                         scenario_data["completed"] = True
                         scenario_data["result"] = {
                             "conversation": scenario_data["conversation"],
                             "judgment": judgment
                         }
         
+        # Collect and return results
         results = []
         for scenario_data in active_scenarios:
             if scenario_data["completed"] and scenario_data["result"]:
                 results.append(scenario_data["result"])
             else:
+                # Force a result for incomplete scenarios
                 judge_prompt = self._create_judge_prompt(
                     scenario_data["scenario"], 
                     scenario_data["conversation"]
@@ -284,6 +362,7 @@ class ValueTester:
         return user_prompt
     
     def _create_user_prompt(self, scenario: ScenarioData, conversation: List[Message]) -> List[Message]:
+        """Create a prompt for the user model"""
         user_prompt = self._create_roleplay_prompt(scenario)
         messages = [{"role": "system", "content": user_prompt}]
         if len(conversation) > 0:
@@ -321,7 +400,8 @@ Write your opening message to the assistant, considering the above dimensions. O
         
         return messages
     
-    def _create_assistant_prompt(self, conversation: List[Message]) -> List[Message]:
+    def _create_assistant_prompt(self, conversation: List[Message], scenario: ScenarioData = None) -> List[Message]:
+        """Create a prompt for the assistant model"""
         system_message = SYSTEM_PROMPT
         if self.steering_prompt:
             system_message = self.steering_prompt
@@ -332,14 +412,16 @@ Write your opening message to the assistant, considering the above dimensions. O
         return messages
     
     def _format_conversation(self, conversation: List[Message]) -> str:
+        """Format a conversation for output"""
         formatted = ""
         for message in conversation:
-            if message["role"] != "system":
+            if message["role"] != "system":  # Skip system messages in formatted output
                 role = message["role"].upper()
                 formatted += f"{role}: {message['content']}\n\n"
         return formatted
     
     def _create_judge_prompt(self, scenario: ScenarioData, conversation: List[Message]) -> List[Message]:
+        """Create a prompt for the judge model"""
         formatted_conversation = self._format_conversation(conversation)
         return [{
             "role": "user", 
