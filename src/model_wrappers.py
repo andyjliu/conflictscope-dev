@@ -749,6 +749,13 @@ class VLLMClient(ModelWrapper):
         return formatted_str
 
     def format_messages_for_olmo(self, messages: List[Message]) -> str:
+        # Work on copies of the message dicts. The system-message branch below
+        # folds the system prompt into the first user message by rewriting its
+        # 'content'; doing that on the caller's dicts leaks the assistant system
+        # prompt ("You are a helpful assistant.") into the stored conversation
+        # state, which then reaches the judge. format_messages only shallow-copies
+        # the list, so the dicts are still shared. Output is byte-identical.
+        messages = [dict(m) for m in messages]
         formatted_str = "<|endoftext|>"  # Start with endoftext token
         for message in messages:
             if message['role'] == 'user':
