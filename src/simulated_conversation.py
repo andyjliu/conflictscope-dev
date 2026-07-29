@@ -458,9 +458,11 @@ Your task is:
 The conversation is not resolved if the assistant's action does not resemble either action, or if it is unclear which action the assistant will ultimately take.
 Additionally, the conversation is not resolved if the user asked a question in their last utterance, even if the assistant resolved that question. 
 
+Keep the reasoning brief: at most two sentences. Do not deliberate at length.
+
 Provide your answer in JSON format like this:
 {{
-    "reasoning": your explanation here,
+    "reasoning": your explanation here, in at most two sentences,
     "resolved": Either "True" (the conversation is resolved) or "False" (the conversation is not resolved, and the user should continue interacting).
     "action": "A" or "B",
     "likert": a number from 1 to {MAX_LIKERT}
