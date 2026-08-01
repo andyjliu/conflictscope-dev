@@ -391,6 +391,79 @@ def evaluate_models_mcq(client: ModelWrapper, scenarios_df: pd.DataFrame, steeri
     
     return results
 
+PARTIAL_SUFFIX = '.partial'
+
+
+def partial_path_for(output_file: str) -> str:
+    """Checkpoint path for an output CSV.
+
+    Separate from the output path because callers treat a non-empty output CSV
+    as a finished eval; the checkpoint is promoted by rename when the run ends.
+    """
+    return output_file + PARTIAL_SUFFIX
+
+
+def _flush_rows(rows: List[Dict[str, Any]], partial_path: Optional[str]) -> None:
+    """Append a batch's rows to the checkpoint.
+
+    fsync because the kills this exists for (scancel, OOM) drop the page cache.
+    Never raises: checkpointing must not fail an otherwise-succeeding eval.
+    """
+    if not partial_path or not rows:
+        return
+    try:
+        df = pd.concat(
+            [_empty_conversation_df(), pd.DataFrame(rows)], ignore_index=True
+        )
+        write_header = not os.path.exists(partial_path)
+        with open(partial_path, 'a') as f:
+            df.to_csv(f, header=write_header, index=False)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception as e:
+        print(f"Warning: could not write partial results to {partial_path}: {e}")
+
+
+def _empty_conversation_df() -> pd.DataFrame:
+    """Empty results frame. Column order is part of the output contract, so
+    checkpoints and the final CSV are both built from this."""
+    return pd.DataFrame({
+        'scenario_id': [],
+        'value1': [],
+        'value2': [],
+        'user_model': [],
+        'assistant_model': [],
+        'judge_model': [],
+        'choice': [],
+        'likert': [],
+        'reasoning': [],
+        'conversation': []
+    })
+
+
+def _conversation_row(
+    scenario_id: str,
+    row,
+    result: Dict[str, Any],
+    user_model: str,
+    assistant_model: str,
+    judge_model: str
+) -> Dict[str, Any]:
+    return {
+        'scenario_id': scenario_id,
+        'generating_model': row['generating_model'],
+        'value1': row['value1'],
+        'value2': row['value2'],
+        'user_model': user_model,
+        'assistant_model': assistant_model,
+        'judge_model': judge_model,
+        'choice': result['choice'],
+        'likert': result['likert'],
+        'reasoning': result['reasoning'],
+        'conversation': result['conversation']
+    }
+
+
 def evaluate_models_conversation(
     client_manager: ModelClientManager,
     scenarios_df: pd.DataFrame,
@@ -401,7 +474,8 @@ def evaluate_models_conversation(
     max_tokens: int,
     batch_size: int = 32,
     cache_file: Optional[str] = None,
-    steering_prompt: Optional[str] = None
+    steering_prompt: Optional[str] = None,
+    partial_path: Optional[str] = None
 ) -> Dict[str, Dict[str, Any]]:
     """
     Probe the model's propensity to follow different principles in conversational contexts.
@@ -486,8 +560,70 @@ def evaluate_models_conversation(
                     "likert": "ERROR",
                     "reasoning": 'ERROR'
                 }
-    
+
+        batch_rows = []
+        for scenario_id in scenario_ids:
+            row_match = batch_df[batch_df['scenario_id'] == scenario_id]
+            if len(row_match) == 0:
+                continue
+            batch_rows.append(_conversation_row(
+                scenario_id, row_match.iloc[0], results[scenario_id],
+                user_model, assistant_model, judge_model
+            ))
+        _flush_rows(batch_rows, partial_path)
+
     return results
+
+def _write_output_atomic(df: pd.DataFrame, output_file: str) -> None:
+    """Write via temp file + rename so the output path never holds a torn file."""
+    tmp_path = f"{output_file}.tmp.{os.getpid()}"
+    with open(tmp_path, 'w') as f:
+        df.to_csv(f, index=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, output_file)
+
+
+def _read_results_csv(path: str) -> pd.DataFrame:
+    """Read a results CSV, skipping a final row torn by a kill mid-append."""
+    try:
+        return pd.read_csv(path)
+    except Exception as e:
+        print(f"Warning: {path} did not parse cleanly ({e}); skipping bad lines.")
+        try:
+            return pd.read_csv(path, on_bad_lines='skip')
+        except Exception as e2:
+            print(f"Warning: could not read prior results from {path}: {e2}")
+            return pd.DataFrame()
+
+
+def _load_prior_results(output_file: str, partial_path: str) -> pd.DataFrame:
+    """The finished CSV plus any checkpoint, checkpoint winning on duplicates.
+
+    ERROR rows are dropped so a rerun retries them instead of freezing them in.
+    """
+    frames = []
+    for path in (output_file, partial_path):
+        if not os.path.exists(path):
+            continue
+        df = _read_results_csv(path)
+        if not df.empty and 'scenario_id' in df.columns:
+            frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    prior = pd.concat(frames, ignore_index=True)
+    prior = prior.drop_duplicates('scenario_id', keep='last')
+
+    if 'choice' in prior.columns:
+        failed = prior['choice'].astype(str) == 'ERROR'
+        if failed.any():
+            print(f"Dropping {int(failed.sum())} prior ERROR rows; they will be retried.")
+            prior = prior[~failed]
+
+    return prior.reset_index(drop=True)
+
 
 def process_csv_file(
     csv_path: str,
@@ -525,35 +661,27 @@ def process_csv_file(
         print(f"No valid scenarios found in {csv_path}. Skipping.")
         return pd.DataFrame()
 
-    # Check if output file exists and has results for these scenarios
-    try:
-        existing_results = pd.read_csv(output_file)
-    except Exception as e:
-        existing_results = pd.DataFrame()
-        
-    if os.path.exists(output_file) and not args.force_recompute:
-        try:
-            existing_results = pd.read_csv(output_file)
-            # Filter to only scenarios from this CSV
-            existing_results_overlap = existing_results[existing_results['scenario_id'].isin(scenarios_df['scenario_id'])]
-            
-            if len(existing_results_overlap) == len(scenarios_df):
-                print(f"Found existing results for all scenarios in {csv_path}. Skipping.")
-                return existing_results
-            elif len(existing_results_overlap) > 0:
-                print(f"Found partial results for {len(existing_results)}/{len(scenarios_df)} scenarios in {csv_path}.")
-                # Remove scenarios that already have results
-                scenarios_df = scenarios_df[~scenarios_df['scenario_id'].isin(existing_results['scenario_id'])]
-                print(f"Will process remaining {len(scenarios_df)} scenarios.")
-        except Exception as e:
-            print(f"Error reading existing results file: {e}")
-            print("Will process all scenarios.")
-            
-    elif os.path.exists(output_file) and args.force_recompute:
+    existing_results = _load_prior_results(output_file, partial_path_for(output_file))
+
+    if not existing_results.empty and not args.force_recompute:
+        done_ids = existing_results['scenario_id']
+        # Filter to only scenarios from this CSV
+        existing_results_overlap = scenarios_df[scenarios_df['scenario_id'].isin(done_ids)]
+
+        if len(existing_results_overlap) == len(scenarios_df):
+            print(f"Found existing results for all scenarios in {csv_path}. Skipping.")
+            return existing_results
+        elif len(existing_results_overlap) > 0:
+            print(f"Found partial results for {len(existing_results_overlap)}/{len(scenarios_df)} scenarios in {csv_path}.")
+            # Remove scenarios that already have results
+            scenarios_df = scenarios_df[~scenarios_df['scenario_id'].isin(done_ids)]
+            print(f"Will process remaining {len(scenarios_df)} scenarios.")
+
+    elif not existing_results.empty and args.force_recompute:
         # delete all results where scenario id is in scenarios_df
         existing_results = existing_results[~existing_results['scenario_id'].isin(scenarios_df['scenario_id'])]
         print(f"Will process all {len(scenarios_df)} scenarios.")
-    
+
     # Load steering prompt if specified
     steering_prompt = None
     if args.steer_prompt:
@@ -574,20 +702,9 @@ def process_csv_file(
             temperature = args.temperature
             max_tokens = args.max_tokens
             
-        results_df = pd.DataFrame({
-            'scenario_id': [],
-            'value1': [],
-            'value2': [],
-            'user_model': [],
-            'assistant_model': [],
-            'judge_model': [],
-            'choice': [],
-            'likert': [],
-            'reasoning': [],
-            'conversation': []
-        })
+        results_df = _empty_conversation_df()
 
-        cache_file = os.path.join(args.output_dir, 'cache.json') if args.cache else None        
+        cache_file = os.path.join(args.output_dir, 'cache.json') if args.cache else None
 
         results = evaluate_models_conversation(
             client_manager,
@@ -599,7 +716,8 @@ def process_csv_file(
             max_tokens=max_tokens,
             batch_size=args.batch_size,
             cache_file=cache_file,
-            steering_prompt=steering_prompt
+            steering_prompt=steering_prompt,
+            partial_path=partial_path_for(output_file)
         )
         
         for scenario_id, result in results.items():
@@ -609,23 +727,14 @@ def process_csv_file(
                 continue
                 
             row = scenario_rows.iloc[0]
-            
-            new_row = {
-                'scenario_id': scenario_id,
-                'generating_model': row['generating_model'],
-                'value1': row['value1'],
-                'value2': row['value2'],
-                'user_model': user_model,
-                'assistant_model': assistant_model,
-                'judge_model': judge_model,
-                'choice': result['choice'],
-                'likert': result['likert'],
-                'reasoning': result['reasoning'],
-                'conversation': result['conversation']
-            }
-            
+
+            new_row = _conversation_row(
+                scenario_id, row, result,
+                user_model, assistant_model, judge_model
+            )
+
             results_df = pd.concat([results_df, pd.DataFrame([new_row])], ignore_index=True)
-    
+
     else:  # MCQ Evaluation
         # Get the MCQ client
         mcq_client = client_manager.get_client(
@@ -737,7 +846,14 @@ def main():
     
     # Initialize an empty DataFrame to store all results
     all_results_df = pd.DataFrame()
-    
+
+    # A forced recompute must not resume from the old run's checkpoint.
+    partial_path = partial_path_for(output_file)
+    if args.force_recompute and os.path.exists(partial_path):
+        os.remove(partial_path)
+
+    wrote_output = False
+
     # Process each CSV file and accumulate results
     for csv_path in csv_files:
         results_df = process_csv_file(
@@ -749,13 +865,17 @@ def main():
             judge_model,
             output_file
         )
-        
+
         if not results_df.empty:
             # Save results after each CSV file is processed
-            results_df.to_csv(output_file, index=False)
+            _write_output_atomic(results_df, output_file)
+            wrote_output = True
             print(f"Updated results saved to {output_file}")
             all_results_df = results_df  # Update the all_results_df with latest results
-    
+
+    if wrote_output and os.path.exists(partial_path):
+        os.remove(partial_path)
+
     print(f"Evaluation complete. Processed {len(csv_files)} CSV files with {len(all_results_df)} total scenarios.")
 
 if __name__ == '__main__':
