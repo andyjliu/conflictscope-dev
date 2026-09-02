@@ -41,7 +41,11 @@ def gpus_needed(model_name: str, bytes_per_param: int = 2, overhead_factor: floa
     if ('claude' in model_lower or 'gpt' in model_lower) and '/' not in model_name and not os.path.exists(model_name):
         return 0
     
-    match = re.search(r'(\d+)b', model_name.lower())
+    # Require the size digits to sit on a token boundary (preceded by start or a
+    # non-alphanumeric like '_'/'-'), so a hex iid hash embedded in a merged-model
+    # path (e.g. "...-ec0516bef394_..._qwen3_8b_merged") does not get misread as a
+    # 516B model. Real size tokens ("_8b", "-70b", "3.6-27b") stay matchable.
+    match = re.search(r'(?<![a-z0-9])(\d+)b', model_name.lower())
     if not match:
         print(f"Could not extract parameter size from model name: {model_name}. Defaulting to 1 GPU.")
         return 1
@@ -711,19 +715,33 @@ class VLLMClient(ModelWrapper):
     
     def format_messages(self, messages: List[Message]) -> str:
         messages = messages.copy()
-        if 'tulu' in self.model_name.lower():
+        name = self.model_name.lower()
+        if 'tulu' in name:
             return(self.format_messages_for_tulu(messages))
-        elif 'olmo' in self.model_name.lower():
-            return(self.format_messages_for_olmo(messages))
-        elif 'wildguard' in self.model_name.lower():
-            return(self.format_messages_for_wildguard(messages))
-        elif 'llama' in self.model_name.lower():
-            return(self.format_messages_for_llama(messages))
-        elif 'qwen' in self.model_name.lower():
+        # Olmo-3 post-trains (allenai/Olmo-3-7B-Instruct-SFT, ...) use ChatML,
+        # not the OLMo-2 <|user|>/<|assistant|> format. Keyed on the hyphenated
+        # HF spelling on purpose: checkpoints WE train from the Olmo-3 base are
+        # named `olmo3_*` and trained under the OLMo-2-style 'olmo' template
+        # (valuegen training.CHAT_TEMPLATES), so they must keep that branch.
+        elif 'olmo-3' in name:
             return(self.format_messages_for_qwen(messages))
-        elif 'gemma' in self.model_name.lower():
+        # Qwen3.5/3.6 instruct models think by default; the served path turns
+        # it off via chat_template_kwargs, the in-process path has to write
+        # the empty think block into the generation prompt itself. Same
+        # keying caveat: our `qwen35_*`/`qwen3_8b` checkpoints (no '.'/'-') keep plain ChatML.
+        elif ('qwen3.5' in name or 'qwen3.6' in name or 'qwen3-' in name) and messages[-1]['role'] != 'assistant':
+            return(self.format_messages_for_qwen(messages) + "<think>\n\n</think>\n\n")
+        elif 'olmo' in name:
+            return(self.format_messages_for_olmo(messages))
+        elif 'wildguard' in name:
+            return(self.format_messages_for_wildguard(messages))
+        elif 'llama' in name:
+            return(self.format_messages_for_llama(messages))
+        elif 'qwen' in name:
+            return(self.format_messages_for_qwen(messages))
+        elif 'gemma' in name:
             return(self.format_messages_for_gemma(messages))
-        elif 'mistral' in self.model_name.lower():
+        elif 'mistral' in name:
             return(self.format_messages_for_mistral(messages))
         else:
             raise NotImplementedError(f"Message formatting not implemented for model {self.model_name}")

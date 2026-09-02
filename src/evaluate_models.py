@@ -80,7 +80,20 @@ class ModelClientManager:
             # Only allocate local GPUs for in-process models; remotely served
             # models (api_base set) load no weights here.
             if not api_base:
-                # 7/7 Hack for CUDA device setting
+                # 7/7 Hack for CUDA device setting. Offsets are relative to
+                # whatever CUDA_VISIBLE_DEVICES the launcher already set,
+                # rather than an absolute range starting at 0 -- when several
+                # independent evaluate_models.py processes are packed onto
+                # one node (each pinned to a different GPU by the launcher),
+                # every process used to recompute the same range(0, N) and
+                # clobber its way onto physical GPU 0, colliding and OOMing
+                # each other (2026-08-20, valuegen's aft_ad_sanitized13_full
+                # packed eval array). A process with no externally-set
+                # CUDA_VISIBLE_DEVICES keeps the original absolute-range
+                # behavior.
+                base_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+                base_devices = base_devices.split(',') if base_devices else None
+
                 gpus_used = 0
                 gpus_required = gpus_needed(model_name)
                 for existing_client_key in self.clients.keys():
@@ -89,9 +102,14 @@ class ModelClientManager:
                         continue  # remote model, occupies no local GPU
                     gpus_used += gpus_needed(existing_model_name)
 
-                cuda_visible_devices = range(gpus_used, gpus_used + gpus_required)
+                if base_devices is not None:
+                    cuda_visible_devices = base_devices[gpus_used:gpus_used + gpus_required]
+                else:
+                    cuda_visible_devices = [
+                        str(d) for d in range(gpus_used, gpus_used + gpus_required)
+                    ]
                 if gpus_required > 0:
-                    os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, cuda_visible_devices))
+                    os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(cuda_visible_devices)
             self.clients[client_key] = ModelWrapper.create(
                 model_name,
                 temperature=temperature,
