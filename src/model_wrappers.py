@@ -109,6 +109,14 @@ class ModelWrapper(ABC):
         # API clients simply ignore these attributes.
         self.allow_thinking = kwargs.pop('allow_thinking', False)
         self.max_model_len = kwargs.pop('max_model_len', None)
+        # Optional prompt scaffold for in-process models (see VLLMClient):
+        # {"chat_template": <jinja str>, "stop": [str, ...], "strip_suffix": str}.
+        # Bypasses the name-based format_messages branches, so a raw base can be
+        # prompted under a zero-shot scaffold (URIAL) instead of a chat template
+        # it never saw. Popped here so it never leaks into SamplingParams.
+        self.scaffold = kwargs.pop('scaffold', None)
+        if self.scaffold is not None and 'chat_template' not in self.scaffold:
+            raise ValueError("scaffold needs a 'chat_template' (jinja string)")
         # Drop top_p if passed; we do not use it for any provider
         self.additional_params = {k: v for k, v in kwargs.items() if k != "top_p"}
         
@@ -311,6 +319,11 @@ class VLLMServerClient(ModelWrapper):
     def __init__(self, model_name: str, base_url: str, api_key: str = "api",
                  max_concurrency: int = 16, **kwargs):
         super().__init__(model_name, **kwargs)
+        if self.scaffold is not None:
+            raise ValueError(
+                f"scaffold given for {model_name}, but it is served remotely and the "
+                "server applies its own chat template; scaffolds need an in-process model"
+            )
         self.base_url = base_url
         self.max_concurrency = max_concurrency
         self.client = OpenAI(base_url=base_url, api_key=api_key)
@@ -700,6 +713,20 @@ class VLLMClient(ModelWrapper):
                 _vllm_instances[model_name] = LLM(**llm_kwargs)
 
             self.llm = _vllm_instances[model_name]
+            self._scaffold_logged = False
+            if self.scaffold is not None:
+                # Interactive generation under a scaffold must terminate on the
+                # scaffold's next-turn markers, not only on eos (a raw base keeps
+                # simulating the conversation otherwise). Merged with, never
+                # replacing, any stop the caller already set.
+                stops = list(self.additional_params.get('stop') or [])
+                stops += [x for x in self.scaffold.get('stop', []) if x not in stops]
+                if stops:
+                    self.additional_params['stop'] = stops
+                logger.info(
+                    f"Scaffold active for {model_name}: stop={stops!r} "
+                    f"strip_suffix={self.scaffold.get('strip_suffix')!r}"
+                )
             self.sampling_params = SamplingParams(
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
@@ -715,6 +742,8 @@ class VLLMClient(ModelWrapper):
     
     def format_messages(self, messages: List[Message]) -> str:
         messages = messages.copy()
+        if self.scaffold is not None:
+            return self.format_messages_with_scaffold(messages)
         name = self.model_name.lower()
         if 'tulu' in name:
             return(self.format_messages_for_tulu(messages))
@@ -746,6 +775,38 @@ class VLLMClient(ModelWrapper):
         else:
             raise NotImplementedError(f"Message formatting not implemented for model {self.model_name}")
         
+    def format_messages_with_scaffold(self, messages: List[Message]) -> str:
+        """Render through the scaffold's own Jinja template via the tokenizer,
+        the same engine the training side uses, so the bytes match the
+        template's author by construction instead of by a hand port."""
+        tokenizer = self.llm.get_tokenizer()
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            chat_template=self.scaffold['chat_template'],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        if not self._scaffold_logged:
+            # One-shot proof the scaffold fired (a base whose name collides with
+            # a chat branch would otherwise get ChatML silently).
+            logger.info(f"Scaffold prompt (first item, head):\n{prompt[:400]}")
+            self._scaffold_logged = True
+        return prompt
+
+    def _finish_scaffold_output(self, text: str) -> str:
+        """Strip the scaffold's answer-closing suffix (e.g. the closing code
+        fence URIAL wraps answers in) from a generation. Stops are exclusive in
+        vLLM, so the text ends right before the next-turn marker."""
+        if self.scaffold is None:
+            return text
+        suffix = self.scaffold.get('strip_suffix')
+        if not suffix:
+            return text
+        t = text.rstrip()
+        if t.endswith(suffix):
+            t = t[:-len(suffix)].rstrip()
+        return t
+
     def format_messages_for_tulu(self, messages: List[Message]) -> str:
         formatted_str = ""
         for message in messages:
@@ -892,7 +953,7 @@ Answers: [/INST]
         # conversation state.
         formatted_msg = self.format_messages(copy.deepcopy(messages))
         response = self.llm.generate([formatted_msg], sampling_params=self.sampling_params, use_tqdm=False)
-        return response[0].outputs[0].text
+        return self._finish_scaffold_output(response[0].outputs[0].text)
 
     def batch_generate(self, messages_list: List[List[Message]], verbose: bool = False) -> List[str]:
         formatted_msgs = [self.format_messages(copy.deepcopy(messages)) for messages in messages_list]
@@ -900,7 +961,7 @@ Answers: [/INST]
             response = self.llm.generate(formatted_msgs, sampling_params=self.sampling_params, use_tqdm=True)
         else:
             response = self.llm.generate(formatted_msgs, sampling_params=self.sampling_params, use_tqdm=False)
-        return [out.outputs[0].text for out in response]
+        return [self._finish_scaffold_output(out.outputs[0].text) for out in response]
         
     def batch_generate_with_probs(self, messages_list: List[List[Message]], outputs: List[str]) -> List[Dict[str, float]]:
         """Generate responses with MCQ logprobs for multiple prompts."""

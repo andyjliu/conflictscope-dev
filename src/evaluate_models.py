@@ -57,16 +57,27 @@ def parse_args():
     parser.add_argument('--judge-api-base', type=str, default=None,
                       help='Remote vLLM endpoint for the judge model')
 
+    # Prompt scaffold for the (in-process) assistant: a JSON file with
+    # {"chat_template": <jinja>, "stop": [...], "strip_suffix": "..."}. Replaces
+    # the name-based chat formatting for that model only -- how a raw base gets
+    # a zero-shot scaffold (URIAL) instead of a chat template it never saw.
+    parser.add_argument('--assistant-scaffold', type=str, default=None,
+                      help='JSON scaffold spec applied to the assistant model (in-process vLLM only)')
+
     return parser.parse_args()
 
 class ModelClientManager:
     """Class to manage model clients and reuse them when possible."""
     
-    def __init__(self, endpoints: Optional[Dict[str, str]] = None):
+    def __init__(self, endpoints: Optional[Dict[str, str]] = None,
+                 scaffolds: Optional[Dict[str, dict]] = None):
         self.clients = {}
         # model_name -> remote vLLM endpoint (URL or hostfile). When present the
         # model is served remotely, so no local weights/GPUs are used for it.
         self.endpoints = endpoints or {}
+        # model_name -> prompt scaffold spec (see --assistant-scaffold). Keyed by
+        # model so it reaches exactly one role even when roles share a model.
+        self.scaffolds = scaffolds or {}
 
     def get_client(self, model_name: str, temperature: float = 0.0, max_tokens: int = 1000) -> ModelWrapper:
         """
@@ -110,11 +121,15 @@ class ModelClientManager:
                     ]
                 if gpus_required > 0:
                     os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(cuda_visible_devices)
+            extra = {}
+            if model_name in self.scaffolds:
+                extra['scaffold'] = self.scaffolds[model_name]
             self.clients[client_key] = ModelWrapper.create(
                 model_name,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 api_base=api_base,
+                **extra,
             )
 
         return self.clients[client_key]
@@ -841,7 +856,14 @@ def main():
         endpoints[assistant_model] = args.assistant_api_base
     if args.judge_api_base:
         endpoints[judge_model] = args.judge_api_base
-    client_manager = ModelClientManager(endpoints=endpoints)
+    scaffolds = {}
+    if args.assistant_scaffold:
+        with open(args.assistant_scaffold, 'r') as f:
+            scaffolds[assistant_model] = json.load(f)
+        if assistant_model in endpoints:
+            raise SystemExit("--assistant-scaffold needs an in-process assistant (no --assistant-api-base)")
+        print(f"Assistant scaffold for {assistant_model}: {args.assistant_scaffold}")
+    client_manager = ModelClientManager(endpoints=endpoints, scaffolds=scaffolds)
 
     # Load steering prompt if specified
     steering_prompt = None
