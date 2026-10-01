@@ -14,11 +14,31 @@ from tqdm import tqdm
 import torch
 from openai import OpenAI, APIError
 from anthropic import Anthropic, APIConnectionError, RateLimitError, APIStatusError
-from vllm import LLM, SamplingParams
+
+# vllm is optional: only the in-process VLLMClient / VLLMLoRAClient paths need it.
+# API-served backends (VLLMServerClient, OpenAI/Anthropic/Gemini) run fine without
+# vllm installed, so defer the import and any failure to actual use.
+try:
+    from vllm import LLM, SamplingParams
+except ModuleNotFoundError:
+    LLM = SamplingParams = None
 
 logger = logging.getLogger(__name__)
 
-def gpus_needed(model_name: str, bytes_per_param: int = 2, overhead_factor: float = 0.2, gpu_memory_gb: int = 48) -> int:
+
+def _require_vllm() -> None:
+    """Ensure ``LLM``/``SamplingParams`` are bound, importing vllm on demand.
+
+    Called by the in-process vLLM clients so a missing vllm surfaces as a clear
+    error only when one of those clients is actually constructed, rather than at
+    module import time.
+    """
+    global LLM, SamplingParams
+    if LLM is None:
+        from vllm import LLM as _LLM, SamplingParams as _SamplingParams
+        LLM, SamplingParams = _LLM, _SamplingParams
+
+def gpus_needed(model_name: str, bytes_per_param: int = 2, overhead_factor: float = 0.2, gpu_memory_gb: Optional[float] = None) -> int:
     """
     Calculate the number of GPUs needed for a model based on its parameter count.
 
@@ -26,7 +46,10 @@ def gpus_needed(model_name: str, bytes_per_param: int = 2, overhead_factor: floa
         model_name: Name of the model containing the size (e.g., "llama-70b", "claude-3-5-sonnet-20b")
         bytes_per_param: Bytes per parameter (default: 2 for FP16)
         overhead_factor: Additional memory overhead factor (default: 0.2 or 20%)
-        gpu_memory_gb: GPU memory in GB (default: 48GB)
+        gpu_memory_gb: GPU memory in GB. Default: $CONFLICTSCOPE_GPU_MEMORY_GB, else 48
+            (the A6000/L40S class this was written for). Clusters with larger GPUs set
+            the variable so a 30B model is not asked to tensor-parallel over GPUs a
+            one-GPU task cannot see.
 
     Returns:
         Number of GPUs needed
@@ -50,6 +73,10 @@ def gpus_needed(model_name: str, bytes_per_param: int = 2, overhead_factor: floa
         print(f"Could not extract parameter size from model name: {model_name}. Defaulting to 1 GPU.")
         return 1
     
+    if gpu_memory_gb is None:
+        gpu_memory_gb = float(os.environ.get("CONFLICTSCOPE_GPU_MEMORY_GB") or 48)
+    if gpu_memory_gb <= 0:
+        raise ValueError(f"gpu_memory_gb must be positive, got {gpu_memory_gb}")
     param_size_billions = int(match.group(1))
     memory_gb = param_size_billions * bytes_per_param * (1 + overhead_factor)
     gpus = math.ceil(memory_gb / gpu_memory_gb)
@@ -694,6 +721,7 @@ _vllm_instances = {}
 class VLLMClient(ModelWrapper):
     
     def __init__(self, model_name: str, **kwargs):
+        _require_vllm()
         super().__init__(model_name, **kwargs)
         # Context window. Default 4096 suits the eval path; thinking generation needs a
         # bigger window (reasoning trace + JSON batch) -- raise via --max-model-len.
@@ -1045,6 +1073,7 @@ class VLLMLoRAClient(ModelWrapper):
     via vLLM with enable_lora=True and applies the adapter at inference time."""
 
     def __init__(self, model_name: str, **kwargs):
+        _require_vllm()
         import json
         super().__init__(model_name, **kwargs)
 
