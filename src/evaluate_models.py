@@ -19,10 +19,10 @@ def parse_args():
     parser = ArgumentParser()
 
     parser.add_argument('--model', '-m', type=str, required=True)
-    parser.add_argument('--temperature', type=float, default=0.0)
+    parser.add_argument('--temperature', type=float, default=None)
     # 12 leaves room for models that emit the end-of-turn marker as literal text
     # after the answer (e.g. gemma-4-31B "4.0<end_of_turn>") so it can be stripped.
-    parser.add_argument('--max-tokens', type=int, default=12)
+    parser.add_argument('--max-tokens', type=int, default=None)
     
     parser.add_argument('--scenarios-dir', '-d', type=str, required=True,
                       help='Directory containing CSV files with scenarios')
@@ -64,7 +64,12 @@ def parse_args():
     parser.add_argument('--assistant-scaffold', type=str, default=None,
                       help='JSON scaffold spec applied to the assistant model (in-process vLLM only)')
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.temperature is None:
+        args.temperature = DEFAULT_CONVERSATION_TEMPERATURE if args.interactive else 0.0
+    if args.max_tokens is None:
+        args.max_tokens = DEFAULT_MAX_TOKENS if args.interactive else 12
+    return args
 
 class ModelClientManager:
     """Class to manage model clients and reuse them when possible."""
@@ -727,13 +732,8 @@ def process_csv_file(
 
     if args.interactive:
         # Set appropriate parameters for conversational evaluation
-        if args.temperature == 0.0 or args.max_tokens <= 5:
-            print("Using default conversation parameters")
-            temperature = DEFAULT_CONVERSATION_TEMPERATURE
-            max_tokens = DEFAULT_MAX_TOKENS
-        else:
-            temperature = args.temperature
-            max_tokens = args.max_tokens
+        temperature = args.temperature
+        max_tokens = args.max_tokens
             
         results_df = _empty_conversation_df()
 
