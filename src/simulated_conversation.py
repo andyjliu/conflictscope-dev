@@ -1,7 +1,8 @@
-from typing import TypedDict, List, Dict
+from typing import TypedDict, List, Dict, Optional, Tuple, Callable
 from dataclasses import dataclass
 from model_wrappers import ModelWrapper, Message
 from utils import parse_json, MAX_LIKERT, SYSTEM_PROMPT
+from user_turn_checks import regex_checker
 import json
 import fcntl
 import os
@@ -78,7 +79,9 @@ class ValueTester:
         min_turns: int = 1,
         max_turns: int = 1,
         cache_file: str = None,
-        steering_prompt: str = None
+        steering_prompt: str = None,
+        turn_checker: Optional[Callable[[List[str]], List[Optional[str]]]] = None,
+        user_turn_attempts: int = 2
     ):
         self.user_client = user_client
         self.assistant_client = assistant_client
@@ -87,6 +90,15 @@ class ValueTester:
         self.max_turns = max_turns
         self.cache_file = cache_file
         self.steering_prompt = steering_prompt
+        # Every generated user turn goes through turn_checker (texts -> reason
+        # or None); a rejected turn is regenerated, up to user_turn_attempts
+        # candidates in all (see user_turn_checks).
+        self.turn_checker = turn_checker or regex_checker
+        self.turn_checker_name = getattr(self.turn_checker, 'name', type(self.turn_checker).__name__)
+        self.user_turn_attempts = user_turn_attempts
+        # scenario_id -> True (every user turn passed) / False (one still failed
+        # after all attempts) / None (an unchecked cached turn was used).
+        self.user_turn_clean: Dict[str, Optional[bool]] = {}
         
     def read_cache_with_retry(self, cache_file: str, max_retries: int = 3, sleep_time: float = 3.0) -> dict:
         for attempt in range(max_retries):
@@ -107,107 +119,146 @@ class ValueTester:
             print(f"Warning: cache unreadable and could not be moved aside: {e}")
         return {}
     
-    def populate_cache_if_needed(self, scenario_id: str, scenario: ScenarioData, user_prompt: str) -> str:
-        def generate_response(prompt: str) -> str:
-            user_response = self.user_client.generate(prompt)
-            user_response = self.generate_artifact_if_needed(scenario, user_response)
-            return user_response
-        
-        with file_lock(f"{self.cache_file}.lock"):
-            cache = self.read_cache_with_retry(self.cache_file)
-            if scenario_id in cache and type(cache[scenario_id]) == str:
-                return cache[scenario_id]
-            
-        response = generate_response(user_prompt)
-        with file_lock(f"{self.cache_file}.lock"):
-            cache = self.read_cache_with_retry(self.cache_file)
-            if scenario_id in cache and isinstance(cache[scenario_id], str):
-                return cache[scenario_id]
-            cache[scenario_id] = response
+    @property
+    def cache_meta_file(self) -> Optional[str]:
+        """Sidecar to the cache: how each cached first turn was produced and checked."""
+        return os.path.splitext(self.cache_file)[0] + '_meta.json' if self.cache_file else None
 
-            write_json_atomic(self.cache_file, cache)
-            return response
+    def populate_cache_if_needed(self, scenario_id: str, scenario: ScenarioData, user_prompt: str) -> str:
+        return self.batch_populate_cache(
+            [{"scenario_id": scenario_id, "scenario": scenario}], [user_prompt])[scenario_id]
 
     def batch_populate_cache(self, scenario_datas: List[dict], user_prompts: List[List[Message]]) -> Dict[str, str]:
         """Batched analogue of populate_cache_if_needed for first-turn user
         messages. Cache hits return immediately; all misses are generated
-        concurrently via batch_generate (instead of one blocking generate per
-        scenario), then written to the shared cache in a single locked pass.
+        concurrently (and checked / re-rolled, see generate_user_turns), then
+        written to the shared cache in a single locked pass.
         Returns {scenario_id: user_response}, ordered to match scenario_datas."""
         results: Dict[str, str] = {}
         with file_lock(f"{self.cache_file}.lock"):
             cache = self.read_cache_with_retry(self.cache_file)
+            meta = self.read_cache_with_retry(self.cache_meta_file)
         miss_data, miss_prompts = [], []
         for sd, prompt in zip(scenario_datas, user_prompts):
             sid = sd["scenario_id"]
             if sid in cache and isinstance(cache[sid], str):
                 results[sid] = cache[sid]
+                self._note_turn(sid, meta.get(sid, {}).get("clean"))
             else:
                 miss_data.append(sd)
                 miss_prompts.append(prompt)
 
         if miss_prompts:
-            responses = self.user_client.batch_generate(miss_prompts)
-            for sd, resp in zip(miss_data, responses):
-                # Artifact expansion is rare; apply per-response after the batch.
-                resp = self.generate_artifact_if_needed(sd["scenario"], resp)
-                results[sd["scenario_id"]] = resp
-            # Single locked write; re-read first so we don't clobber entries a
-            # concurrent job populated, and prefer any value already present.
-            with file_lock(f"{self.cache_file}.lock"):
-                cache = self.read_cache_with_retry(self.cache_file)
-                for sd in miss_data:
-                    sid = sd["scenario_id"]
-                    if sid in cache and isinstance(cache[sid], str):
-                        results[sid] = cache[sid]
-                    else:
-                        cache[sid] = results[sid]
-                write_json_atomic(self.cache_file, cache)
+            records = self.generate_user_turns([sd["scenario"] for sd in miss_data], miss_prompts)
+            results.update(self._write_cache([sd["scenario_id"] for sd in miss_data], records, overwrite=False))
         return results
 
-    def generate_artifact_if_needed(self, scenario: ScenarioData, user_response: str) -> str:
-        # Check if response contains artifact tags
-        if '<ARTIFACT>' in user_response and '</ARTIFACT>' in user_response:
-            try:
-                # Find the start and end positions of the artifact tags
-                start_tag = '<ARTIFACT>'
-                end_tag = '</ARTIFACT>'
-                start_pos = user_response.find(start_tag)
-                end_pos = user_response.find(end_tag)
-                if start_pos == -1 or end_pos == -1 or start_pos >= end_pos:
-                    print(f"Warning: Malformed artifact tags in user response.")
-                    return user_response
+    def materialize_first_turns(self, scenario_datas: List[dict], user_prompts: List[List[Message]]) -> Dict[str, dict]:
+        """Fix the first user turn of each scenario in the cache, checked.
 
-                artifact_description = user_response[start_pos + len(start_tag):end_pos].strip()
-                if not artifact_description:
-                    print(f"Warning: Empty artifact description found in user response")
-                    return user_response
-                roleplay_prompt = self._create_roleplay_prompt(scenario)
+        Unlike batch_populate_cache, cached turns are not trusted: each one is
+        run through ``turn_checker`` as the first candidate and regenerated if
+        rejected (overwriting the cache entry; the old text is kept in the
+        meta file under "replaced"). Returns {scenario_id: record} (see
+        generate_user_turns); ``record["clean"]`` says whether the turn now in
+        the cache passed."""
+        sids = [sd["scenario_id"] for sd in scenario_datas]
+        with file_lock(f"{self.cache_file}.lock"):
+            cache = self.read_cache_with_retry(self.cache_file)
+        initial = [cache[sid] if isinstance(cache.get(sid), str) else None for sid in sids]
+        records = self.generate_user_turns([sd["scenario"] for sd in scenario_datas], user_prompts, initial=initial)
+        self._write_cache(sids, records, overwrite=True)
+        return dict(zip(sids, records))
 
-                artifact_prompt = (
-                    f"{roleplay_prompt}\n"
-                    f"You have written the following prompt: {user_response}\n"
-                    f"Generate the artifact: {artifact_description}\n"
-                    f"Only return the artifact. Do not include any other text in your response."
-                )
-                artifact = self.user_client.generate(
-                    [{"role": "user", "content": artifact_prompt}]).strip()
-                return (user_response[:start_pos] + artifact
-                        + user_response[end_pos + len(end_tag):])
+    def _write_cache(self, sids: List[str], records: List[dict], overwrite: bool) -> Dict[str, str]:
+        """Write turns + their meta in one locked pass; returns what the cache holds.
 
+        Re-reads first so concurrent jobs aren't clobbered. Without
+        ``overwrite`` an entry another job wrote meanwhile wins (the eval
+        path); with it, these records replace the cached turns (the check path)."""
+        with file_lock(f"{self.cache_file}.lock"):
+            cache = self.read_cache_with_retry(self.cache_file)
+            meta = self.read_cache_with_retry(self.cache_meta_file)
+            for sid, rec in zip(sids, records):
+                old = cache.get(sid) if isinstance(cache.get(sid), str) else None
+                if old is not None and not overwrite:
+                    self._note_turn(sid, meta.get(sid, {}).get("clean"))
+                    continue
+                entry = dict(meta.get(sid, {}))
+                if rec["from_cache"]:
+                    # Same text as before: keep how it was produced, update the verdict.
+                    entry.update(clean=rec["clean"], reason=rec["reason"], checker=rec["checker"])
+                else:
+                    if old is not None and old != rec["text"]:
+                        entry.setdefault("replaced", old)
+                    entry.update({k: rec[k] for k in ("raw", "artifact_route", "attempts",
+                                                       "clean", "reason", "checker")})
+                cache[sid] = rec["text"]
+                meta[sid] = entry
+                self._note_turn(sid, rec["clean"])
+            write_json_atomic(self.cache_file, cache)
+            write_json_atomic(self.cache_meta_file, meta)
+            return {sid: cache[sid] for sid in sids}
 
-            except Exception as e:
-                print(f"Error processing artifact in user response: {e}")
-                # Return the original response if artifact processing fails
-                return user_response
+    def _note_turn(self, scenario_id: str, clean: Optional[bool]) -> None:
+        """Fold one user turn's verdict into the scenario's: any rejected turn
+        makes it False, an unchecked one (old cache entry) makes it None."""
+        if scenario_id is None:
+            return
+        prev = self.user_turn_clean.get(scenario_id, True)
+        if prev is False or clean is False:
+            self.user_turn_clean[scenario_id] = False
+        elif prev is None or clean is None:
+            self.user_turn_clean[scenario_id] = None
         else:
-            return user_response
+            self.user_turn_clean[scenario_id] = True
 
-    def expand_artifacts_batch(self, scenarios: List[ScenarioData], user_responses: List[str]) -> List[str]:
-        """Batched version of generate_artifact_if_needed: expand any <ARTIFACT> description
-        into real content with a single batched generation call over the responses that need it.
-        Responses without well-formed tags pass through untouched."""
+    def generate_user_turns(self, scenarios: List[ScenarioData], user_prompts: List[List[Message]],
+                            initial: Optional[List[Optional[str]]] = None) -> List[dict]:
+        """Generate one user turn per prompt, expanding any <ARTIFACT> request,
+        and regenerate the whole turn (same prompts) while ``turn_checker``
+        rejects it, up to ``user_turn_attempts`` candidates in all. A non-None
+        ``initial[i]`` (e.g. a cached turn) is checked as the first candidate.
+
+        Returns one record per prompt: text (the last candidate, even if it was
+        rejected), raw (the turn before artifact expansion; None for an initial
+        text), artifact_route, attempts (1-based index of the candidate),
+        from_cache, clean, reason, checker."""
+        records: List[dict] = [None] * len(user_prompts)
+        pending = list(range(len(user_prompts)))
+        for attempt in range(1, self.user_turn_attempts + 1):
+            if not pending:
+                break
+            to_generate = []
+            for i in pending:
+                if attempt == 1 and initial is not None and initial[i] is not None:
+                    records[i] = {"text": initial[i], "raw": None, "artifact_route": None,
+                                  "attempts": attempt, "from_cache": True}
+                else:
+                    to_generate.append(i)
+            if to_generate:
+                raws = self.user_client.batch_generate([user_prompts[i] for i in to_generate])
+                expanded = self._expand_artifacts([scenarios[i] for i in to_generate], raws)
+                for i, raw, (text, artifact_route) in zip(to_generate, raws, expanded):
+                    records[i] = {"text": text, "raw": raw, "artifact_route": artifact_route,
+                                  "attempts": attempt, "from_cache": False}
+            reasons = self.turn_checker([records[i]["text"] for i in pending])
+            for i, reason in zip(pending, reasons):
+                records[i].update(clean=reason is None, reason=reason, checker=self.turn_checker_name)
+            pending = [i for i, reason in zip(pending, reasons) if reason is not None]
+        if pending:
+            print(f"Warning: {len(pending)}/{len(user_prompts)} user turns still failed the "
+                  f"{self.turn_checker_name} check after {self.user_turn_attempts} attempts.")
+        return records
+
+    def _expand_artifacts(self, scenarios: List[ScenarioData], user_responses: List[str]) -> List[Tuple[str, bool]]:
+        """Expand any <ARTIFACT> description into real content with a single
+        batched generation call over the responses that need it. Returns
+        (turn, artifact_route) per response. Responses without well-formed
+        tags, or whose artifact comes back empty, keep their tags, which the
+        turn checker rejects."""
         start_tag, end_tag = '<ARTIFACT>', '</ARTIFACT>'
+        out = [(resp, False) for resp in user_responses]
         artifact_prompts = []
         targets = []  # (index, start_pos, end_pos)
         for i, (scenario, resp) in enumerate(zip(scenarios, user_responses)):
@@ -232,19 +283,20 @@ class ValueTester:
             targets.append((i, start_pos, end_pos))
 
         if not artifact_prompts:
-            return user_responses
+            return out
 
         try:
             artifacts = self.user_client.batch_generate(artifact_prompts)
         except Exception as e:
             print(f"Error generating artifacts in batch: {e}")
-            return user_responses
+            return out
 
         for (i, start_pos, end_pos), artifact in zip(targets, artifacts):
+            if not (artifact or '').strip():
+                continue
             resp = user_responses[i]
-            user_responses[i] = (resp[:start_pos] + artifact.strip()
-                                 + resp[end_pos + len(end_tag):])
-        return user_responses
+            out[i] = (resp[:start_pos] + artifact.strip() + resp[end_pos + len(end_tag):], True)
+        return out
 
     def test_scenarios_batch(self, scenarios: List[ScenarioData], scenario_ids: List[str]) -> List[dict]:
         """Run multiple scenarios in batch processing mode with caching"""
@@ -289,13 +341,11 @@ class ValueTester:
                         {"role": "user", "content": cached[scenario_data["scenario_id"]]})
 
             if scenarios_for_generation:
-                user_responses = self.user_client.batch_generate(user_prompts)
-                user_responses = self.expand_artifacts_batch(
-                    [s["scenario"] for s in scenarios_for_generation], user_responses)
-
-
-                for scenario_data, user_response in zip(scenarios_for_generation, user_responses):
-                    scenario_data["conversation"].append({"role": "user", "content": user_response})
+                records = self.generate_user_turns(
+                    [s["scenario"] for s in scenarios_for_generation], user_prompts)
+                for scenario_data, record in zip(scenarios_for_generation, records):
+                    scenario_data["conversation"].append({"role": "user", "content": record["text"]})
+                    self._note_turn(scenario_data["scenario_id"], record["clean"])
             
             # BATCH ASSISTANT STEP: Generate assistant responses for all incomplete scenarios
             assistant_prompts = []
