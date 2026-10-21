@@ -42,6 +42,9 @@ def parse_args():
     parser.add_argument('--assistant-model', type=str, help='Model for assistant (defaults to --model)')
     parser.add_argument('--judge-model', type=str, help='Model for judgment (defaults to 4o-mini)', default = 'gpt-4o-mini')
     parser.add_argument('--cache', action='store_true')
+    parser.add_argument('--user-turn-attempts', type=int, default=2,
+                      help='Candidates per simulated user turn: a turn the regex check rejects '
+                           '(e.g. a refusal spliced in as an artifact) is regenerated; 1 disables (default: 2)')
     parser.add_argument('--steer-prompt', type=str, help='Path to a text file containing the steering prompt for the assistant')
     parser.add_argument('--max-scenarios', type=int, default=None,
                       help='Maximum number of scenarios to evaluate per CSV file')
@@ -475,7 +478,8 @@ def _empty_conversation_df() -> pd.DataFrame:
         'choice': [],
         'likert': [],
         'reasoning': [],
-        'conversation': []
+        'conversation': [],
+        'user_turn_clean': []
     })
 
 
@@ -498,8 +502,39 @@ def _conversation_row(
         'choice': result['choice'],
         'likert': result['likert'],
         'reasoning': result['reasoning'],
-        'conversation': result['conversation']
+        'conversation': result['conversation'],
+        # True / False: every simulated user turn passed / one still failed the
+        # turn check (see user_turn_checks); empty: a cached turn with no record.
+        'user_turn_clean': result.get('user_turn_clean')
     }
+
+
+def check_user_turn_cache(scenarios_df: pd.DataFrame, cache_file: Optional[str], csv_path: str) -> None:
+    """Scenarios marked by ``filter_scenarios.py --check-user-turns`` were
+    kept for the first user turn that check wrote to the cache. Without the
+    cache the eval would generate fresh, unchecked turns, so refuse; with it,
+    warn about kept scenarios whose checked turn is missing (a different cache)."""
+    if 'check_results' not in scenarios_df.columns:
+        return
+    checked = scenarios_df['check_results'].apply(
+        lambda c: isinstance(c, dict) and c.get('user_prompt_clean') is not None)
+    if not checked.any():
+        return
+    if cache_file is None:
+        raise SystemExit(
+            f"{csv_path}: scenarios were selected by --check-user-turns against a cached "
+            "first user turn; rerun with --cache and the cache.json that check wrote "
+            "(in --output-dir), or the eval uses unchecked first turns.")
+    cache = {}
+    if os.path.exists(cache_file):
+        with open(cache_file, 'r') as f:
+            cache = json.load(f)
+    kept = scenarios_df[checked & (scenarios_df['keep_scenario'] == True)]
+    missing = int((~kept['scenario_id'].astype(str).isin(set(cache))).sum())
+    if missing:
+        print(f"Warning: {missing}/{len(kept)} checked scenarios in {csv_path} have no first "
+              f"turn in {cache_file}; those turns will be generated fresh (regex-checked "
+              f"only, not the turn that --check-user-turns cleared).")
 
 
 def evaluate_models_conversation(
@@ -513,7 +548,8 @@ def evaluate_models_conversation(
     batch_size: int = 32,
     cache_file: Optional[str] = None,
     steering_prompt: Optional[str] = None,
-    partial_path: Optional[str] = None
+    partial_path: Optional[str] = None,
+    user_turn_attempts: int = 2
 ) -> Dict[str, Dict[str, Any]]:
     """
     Probe the model's propensity to follow different principles in conversational contexts.
@@ -549,7 +585,8 @@ def evaluate_models_conversation(
         assistant_client=assistant_client,
         judge_client=judge_client,
         cache_file=cache_file,
-        steering_prompt=steering_prompt
+        steering_prompt=steering_prompt,
+        user_turn_attempts=user_turn_attempts
     )
     
     # Process scenarios in batches
@@ -588,7 +625,8 @@ def evaluate_models_conversation(
                     "conversation": batch_tester._format_conversation(result["conversation"]),
                     "choice": result["judgment"]["action"],
                     "likert": -1 + 2*(likert - 1)/(MAX_LIKERT - 1) if type(likert) == int else 'INVALID',
-                    "reasoning": result["judgment"].get("reasoning", "")
+                    "reasoning": result["judgment"].get("reasoning", ""),
+                    "user_turn_clean": batch_tester.user_turn_clean.get(scenario_id)
                 }
             except KeyError:
                 print(f"Exception on scenario {scenario_id}")
@@ -596,7 +634,8 @@ def evaluate_models_conversation(
                     "conversation": 'ERROR',
                     "choice": 'ERROR',
                     "likert": "ERROR",
-                    "reasoning": 'ERROR'
+                    "reasoning": 'ERROR',
+                    "user_turn_clean": batch_tester.user_turn_clean.get(scenario_id)
                 }
 
         batch_rows = []
@@ -738,6 +777,7 @@ def process_csv_file(
         results_df = _empty_conversation_df()
 
         cache_file = os.path.join(args.output_dir, 'cache.json') if args.cache else None
+        check_user_turn_cache(scenarios_df, cache_file, csv_path)
 
         results = evaluate_models_conversation(
             client_manager,
@@ -750,7 +790,8 @@ def process_csv_file(
             batch_size=args.batch_size,
             cache_file=cache_file,
             steering_prompt=steering_prompt,
-            partial_path=partial_path_for(output_file)
+            partial_path=partial_path_for(output_file),
+            user_turn_attempts=args.user_turn_attempts
         )
         
         for scenario_id, result in results.items():
