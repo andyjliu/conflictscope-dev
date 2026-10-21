@@ -1,7 +1,13 @@
 from model_wrappers import ModelWrapper
 from utils import SYSTEM_PROMPT, parse_json, load_value_dict
+from simulated_conversation import ValueTester, load_scenario
+from user_turn_checks import JudgeChecker
+from evaluate_models import (DEFAULT_CONVERSATION_TEMPERATURE, DEFAULT_MAX_TOKENS,
+                             convert_row_to_scenario, load_scenarios_from_csv)
 from argparse import ArgumentParser
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+import glob
 import os
 import json
 import pandas as pd
@@ -23,8 +29,8 @@ def parse_args():
     parser.add_argument('--api-base', type=str, default=None,
                         help='Explicit base URL for a remote vLLM OpenAI-compatible server')
 
-    parser.add_argument('--input-file', '-i', type=str, required=True,
-                        help='Input JSON file containing scenarios')
+    parser.add_argument('--input-file', '-i', type=str, default=None,
+                        help='Input JSON file containing scenarios (optional with --check-user-turns)')
     parser.add_argument('--output-dir', '-o', type=str, required=True,
                         help='Output directory')
                         
@@ -39,8 +45,37 @@ def parse_args():
     parser.add_argument('--agreement-examples', type=str, 
                         default='notebooks/0520/agreement_analysis/agreement_analysis_sample100.csv',
                         help='CSV file with examples for agreement few-shot prompting')
-    
-    return parser.parse_args()
+
+    # Check the simulated user's first turn (see check_user_turns). Runs on the
+    # CSV just written when -i is given, else on every top-level *.csv in -o.
+    parser.add_argument('--check-user-turns', action='store_true',
+                        help='Generate (or reuse) each kept scenario\'s first user turn in --cache-file, '
+                             'judge it, regenerate once if contaminated, and drop the scenario if it still is')
+    parser.add_argument('--cache-file', type=str, default=None,
+                        help='cache.json the interactive eval will read (<evaluate_models -o>/cache.json)')
+    parser.add_argument('--user-model', type=str, default=None,
+                        help='User-simulator model; must match the eval\'s --user-model')
+    parser.add_argument('--user-api-base', type=str, default=None,
+                        help='Remote vLLM endpoint for the user model')
+    parser.add_argument('--user-temperature', type=float, default=DEFAULT_CONVERSATION_TEMPERATURE,
+                        help='User-model sampling temperature; must match the eval (default: %(default)s)')
+    parser.add_argument('--user-max-tokens', type=int, default=DEFAULT_MAX_TOKENS,
+                        help='User-model max tokens; must match the eval (default: %(default)s)')
+    parser.add_argument('--turn-judge-model', type=str, default=None,
+                        help='Model that judges user turns (default: --user-model)')
+    parser.add_argument('--turn-judge-api-base', type=str, default=None,
+                        help='Endpoint for the turn judge (default: --user-api-base when the judge is the user model)')
+    parser.add_argument('--turn-judge-max-tokens', type=int, default=1024)
+    parser.add_argument('--user-turn-attempts', type=int, default=2,
+                        help='Candidate first turns per scenario before it is dropped (default: 2, i.e. one retry)')
+    parser.add_argument('--check-batch-size', type=int, default=64)
+
+    args = parser.parse_args()
+    if not args.input_file and not args.check_user_turns:
+        parser.error('give --input-file, --check-user-turns, or both')
+    if args.check_user_turns and not (args.cache_file and args.user_model):
+        parser.error('--check-user-turns needs --cache-file and --user-model')
+    return args
 
 def check_scenario_realism(scenario: Dict[str, Any], client: ModelWrapper) -> bool:
     """
@@ -394,6 +429,109 @@ def filter_scenarios(
 
     return results
 
+USER_TURN_CHECK = 'user_prompt_clean'
+
+
+def build_turn_tester(args) -> ValueTester:
+    """A ValueTester whose user client matches the eval's and whose turn
+    checker is the LLM judge (by default the user model itself, at temperature 0)."""
+    user_client = ModelWrapper.create(
+        args.user_model,
+        temperature=args.user_temperature,
+        max_tokens=args.user_max_tokens,
+        api_base=args.user_api_base,
+    )
+    judge_model = args.turn_judge_model or args.user_model
+    judge_api_base = args.turn_judge_api_base or (
+        args.user_api_base if judge_model == args.user_model else None)
+    judge_client = ModelWrapper.create(
+        judge_model,
+        temperature=0.0,
+        max_tokens=args.turn_judge_max_tokens,
+        api_base=judge_api_base,
+    )
+    return ValueTester(
+        user_client=user_client,
+        assistant_client=None,
+        judge_client=None,
+        cache_file=args.cache_file,
+        turn_checker=JudgeChecker(judge_client),
+        user_turn_attempts=args.user_turn_attempts,
+    )
+
+
+def check_user_turns(csv_path: str, tester: ValueTester, batch_size: int = 64) -> Dict[str, Any]:
+    """Fix and check the first simulated user turn of every kept scenario.
+
+    The interactive eval sends the assistant a first user turn from the cache
+    (``evaluate_models.py -i --cache``). This writes that turn now, through the
+    same prompts and artifact expansion the eval uses, judges it (see
+    user_turn_checks), regenerates it if contaminated, and records
+    ``user_prompt_clean`` in check_results: True / False for every scenario
+    examined, absent for rows that were never kept. ``keep_scenario`` becomes
+    False where the turn is still contaminated, so the kept set only contains
+    scenarios whose cached first turn is clean -- as long as the eval reads
+    that cache.
+
+    Idempotent: rows a previous run dropped are examined again (their cached
+    turn is re-judged, not regenerated, unless it fails).
+    """
+    df = pd.read_csv(csv_path)
+    scenarios_df = load_scenarios_from_csv(csv_path)  # the eval's loader
+    checks = [c if isinstance(c, dict) else {} for c in scenarios_df['check_results']] \
+        if 'check_results' in scenarios_df.columns else [{} for _ in range(len(df))]
+    candidates = [i for i in range(len(df))
+                  if df['keep_scenario'].iloc[i] == True or checks[i].get(USER_TURN_CHECK) is False]
+
+    items = []  # (row index, scenario_data, prompt)
+    for i in candidates:
+        row = scenarios_df.iloc[i]
+        try:
+            scenario = load_scenario(convert_row_to_scenario(row))
+        except KeyError as e:
+            print(f"Skipping scenario {row['scenario_id']}: missing required field {e}")
+            continue
+        items.append((i, {"scenario_id": row['scenario_id'], "scenario": scenario},
+                      tester._create_user_prompt(scenario, [])))
+
+    records = {}
+    for start in tqdm(range(0, len(items), batch_size), desc=f"Checking user turns ({os.path.basename(csv_path)})"):
+        batch = items[start:start + batch_size]
+        out = tester.materialize_first_turns([sd for _, sd, _ in batch], [p for _, _, p in batch])
+        for i, sd, _ in batch:
+            records[i] = out[sd["scenario_id"]]
+
+    check_col = df['check_results'].tolist() if 'check_results' in df.columns else [json.dumps({})] * len(df)
+    keep_col = df['keep_scenario'].tolist()
+    for i, rec in records.items():
+        checks[i][USER_TURN_CHECK] = rec["clean"]
+        check_col[i] = json.dumps(checks[i])
+        keep_col[i] = bool(rec["clean"])
+    kept_before = int((df['keep_scenario'] == True).sum())
+    df['check_results'] = check_col
+    df['keep_scenario'] = keep_col
+    tmp_path = f"{csv_path}.tmp.{os.getpid()}"
+    df.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, csv_path)
+
+    recs = list(records.values())
+    summary = {
+        'examined': len(recs),
+        'kept_before': kept_before,
+        'kept_after': int((df['keep_scenario'] == True).sum()),
+        'clean_first_candidate': sum(r["clean"] and r["attempts"] == 1 for r in recs),
+        'clean_after_retry': sum(r["clean"] and r["attempts"] > 1 for r in recs),
+        'dropped': sum(not r["clean"] for r in recs),
+        'dropped_reasons': dict(Counter(r["reason"] for r in recs if not r["clean"])),
+        'regenerated': sum(not r["from_cache"] for r in recs),
+    }
+    print(f"{csv_path}: user-turn check ({tester.turn_checker_name}) on {summary['examined']} scenarios: "
+          f"{summary['clean_first_candidate']} clean, {summary['clean_after_retry']} clean after retry, "
+          f"{summary['dropped']} dropped {summary['dropped_reasons']}; "
+          f"keep_scenario {summary['kept_before']} -> {summary['kept_after']}")
+    return summary
+
+
 def scenarios_to_dataframe(scenarios, filename):
     """
     Convert scenarios dictionary to a pandas DataFrame with specific columns.
@@ -442,9 +580,8 @@ def convert_to_value_shortform(df: pd.DataFrame, values: Dict[str, str]) -> pd.D
     df['value2'] = df['value2'].apply(lambda x: values[x])
     return(df)
 
-def main():
-    args = parse_args()
-    
+def filter_input_file(args) -> str:
+    """Run the quality checks on --input-file; returns the output CSV path."""
     value_dict = load_value_dict(args.value_set)
 
     # Initialize model client (skip if --no-filter)
@@ -479,7 +616,7 @@ def main():
 
     if not valid_scenarios:
         print(f"No new valid scenarios found in {args.input_file}")
-        return
+        return output_file
     else:
         print(f"Found {len(valid_scenarios)} valid scenarios to filter")
     
@@ -526,6 +663,21 @@ def main():
     kept_count = sum(1 for s in filtered_scenarios.values() if s.get('keep_scenario', False))
     print(f"Filtering complete: {kept_count}/{len(filtered_scenarios)} scenarios kept")
     print(f"Results saved to {output_file}")
+    return output_file
+
+def main():
+    args = parse_args()
+    csv_paths = []
+    if args.input_file:
+        csv_paths = [filter_input_file(args)]
+    if args.check_user_turns:
+        if not csv_paths:
+            # the same top-level *.csv that evaluate_models.py -d reads
+            csv_paths = sorted(glob.glob(os.path.join(args.output_dir, '*.csv')))
+        tester = build_turn_tester(args)
+        for csv_path in csv_paths:
+            if os.path.exists(csv_path):
+                check_user_turns(csv_path, tester, batch_size=args.check_batch_size)
 
 if __name__ == '__main__':
     main()
